@@ -66,6 +66,12 @@ python app.py --input synth                # встроенная демо-сц�
 - Брандмауэр Windows (если телефон не открывает страницу по Wi-Fi, cmd от админа):
   `netsh advfirewall firewall add rule name="AI HUD" dir=in action=allow protocol=TCP localport=5000`
 
+> ℹ️ **Про ошибку «Missing Traffic Access Token»:** это защита облачного превью Arena/e2b —
+> адрес `https://5000-…e2b.app` открыт только из окна превью (платформа подписывает запросы
+> токеном). Открыть его с телефона или из новой вкладки нельзя. Приложение определяет это
+> автоматически (`sandboxed` в `/api/state`): в превью QR-код заменяется инструкцией, а при
+> запуске на своём ПК/телефоне всё работает как описано выше.
+
 ## 📹 Телефон как IP-камера
 
 1. Установите **«IP Webcam»** (Google Play, автор Pavel Khlebovich); аналог для iOS — iVCam / DroidCam.

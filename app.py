@@ -2078,7 +2078,15 @@ function showCamAsk(){ $('camAsk').classList.add('show'); }
 function hideCamAsk(){ $('camAsk').classList.remove('show'); }
 function dismissCamAsk(){ camDismissed = true; hideCamAsk(); toast('Демо-режим. Кнопка «Включить камеру» всегда доступна.'); }
 function showCamErr(msg){
-  var e = $('camErr'); e.innerHTML = msg; e.classList.add('show');
+  var e = $('camErr');
+  // в облачной песочнице прокси может блокировать камеру — добавляем подсказку
+  if(window._sandboxed){
+    msg += '<br><br><b>Вы в облачной песочнице:</b> её адрес защищён токеном доступа, '
+         + 'камера может быть заблокирована прокси. Запустите приложение на своём '
+         + 'устройстве (ПК: <code>python app.py</code>, телефон: <code>bash run_phone.sh</code>) — '
+         + 'там камера работает полноценно.';
+  }
+  e.innerHTML = msg; e.classList.add('show');
   $('camAsk').classList.add('show');
 }
 
@@ -2270,6 +2278,26 @@ function pollState(){
       camAskShown = true;
       showCamAsk();
     }
+    // ПЕСОЧНИЦА (облачное превью): адрес защищён токеном доступа — с телефона
+    // его не открыть; QR прячем и показываем инструкцию для локального запуска
+    window._sandboxed = !!s.sandboxed;
+    if(window._sandboxed && !window._sandboxNoteDone){
+      window._sandboxNoteDone = true;
+      var qb = $('qrBox');
+      if(qb){
+        qb.innerHTML = '<div class="hint" style="text-align:left">'
+          + '&#128274; Это превью в облачной песочнице: адрес защищён токеном доступа '
+          + 'и открывается только из этого окна браузера (поэтому QR здесь не работает).<br><br>'
+          + '<b>Как запустить на своём устройстве:</b><br>'
+          + '&bull; ПК: <code>python app.py</code> (для камеры телефона по Wi-Fi — '
+          + '<code>python app.py --https</code>)<br>'
+          + '&bull; Телефон (Termux): <code>bash run_phone.sh</code> → в браузере '
+          + '<code>http://127.0.0.1:5000</code> — камера работает сразу.'
+          + '</div>';
+      }
+      var pi = $('phoneUrlInline');
+      if(pi){ pi.innerHTML = '— недоступно из песочницы (запустите на своём ПК/телефоне) —'; }
+    }
     var up = Math.floor(s.uptime_sec);
     $('uptime').textContent = 'UPTIME ' + Math.floor(up/3600) + 'ч ' +
       Math.floor(up%3600/60) + 'м ' + (up%60) + 'с';
@@ -2379,7 +2407,14 @@ window.addEventListener('appinstalled', function(){
 });
 // Service Worker работает только в защищённом контексте (HTTPS/localhost) —
 // при открытии по http://IP он молча не зарегистрируется, это нормально.
-if('serviceWorker' in navigator){
+// В облачной песочнице (*.e2b.app и прочие публичные хосты) SW не регистрируем:
+// прокси песочницы требует токен доступа на каждый запрос, кэш тут только мешает.
+function isLocalHostName(){
+  var h = location.hostname;
+  return h === 'localhost' || h.indexOf('127.') === 0 || /^192\.168\./.test(h)
+      || /^10\./.test(h) || /^172\.(1[6-9]|2[0-9]|3[01])\./.test(h);
+}
+if('serviceWorker' in navigator && window.isSecureContext && isLocalHostName()){
   window.addEventListener('load', function(){
     navigator.serviceWorker.register('/sw.js').catch(function(){});
   });
@@ -2431,6 +2466,17 @@ def _local_server_urls(port: int) -> list:
     return urls
 
 
+def _request_is_local() -> bool:
+    """ОПИСАНИЕ ЛОГИКИ: страница открыта на этой же машине (localhost/локальный IP)?
+    Если НЕТ — мы в облачной песочнице/прокси (например *.e2b.app): такой адрес
+    защищён токеном доступа, с телефона его не открыть, QR бесполезен, service
+    worker не нужен. Флаг уходит в /api/state, фронтенд адаптирует подсказки."""
+    host = (request.host or "").split(":")[0]
+    if host == "localhost" or host.startswith("127.") or host.startswith("0.0.0.0"):
+        return True
+    return bool(re.match(r"^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)", host))
+
+
 @app.route("/")
 def index():
     """Главная страница: HUD + боковая панель (HTML/CSS/JS зашиты в шаблон выше)."""
@@ -2446,14 +2492,21 @@ def index():
 # ======================================================================================
 
 SW_JS = r"""// AI HUD service worker: кэшируем только оболочку, потоки и API — всегда сеть.
-const CACHE = 'ai-hud-v1';
+// Регистрируется только при локальном запуске (localhost/локальный IP): в облачных
+// песочницах прокси требует токен доступа на каждый запрос — кэш там не нужен.
+const CACHE = 'ai-hud-v2';
 const SHELL = ['/', '/manifest.json', '/icon/192.png', '/icon/512.png'];
 self.addEventListener('install', function(e){
   e.waitUntil(caches.open(CACHE).then(function(c){ return c.addAll(SHELL); })
     .then(function(){ return self.skipWaiting(); }));
 });
 self.addEventListener('activate', function(e){
-  e.waitUntil(self.clients.claim());
+  e.waitUntil(
+    caches.keys().then(function(keys){
+      return Promise.all(keys.filter(function(k){ return k !== CACHE; })
+        .map(function(k){ return caches.delete(k); }));
+    }).then(function(){ return self.clients.claim(); })
+  );
 });
 self.addEventListener('fetch', function(e){
   if (e.request.method !== 'GET') return;
@@ -2644,6 +2697,7 @@ def api_state():
     mode = app_state["mode"]
     return jsonify({
         "mode": mode,
+        "sandboxed": not _request_is_local(),
         "source": _capture.active_source if _capture else "-",
         "source_synthetic": bool(_capture.is_synthetic) if _capture else True,
         "browser": browser_info,
