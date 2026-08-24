@@ -7,8 +7,9 @@
 #
 #  ------------------------------- requirements.txt ---------------------------------
 #  flask>=3.0
-#  opencv-python>=4.8        # на сервере без дисплея: opencv-python-headless
-#  ultralytics>=8.1.0        # YOLOv8 (torch ставится автоматически как зависимость)
+#  opencv-python>=4.8,<5   # ветка 4.x: содержит HOG-детектор людей (реальный fallback)
+#                          # на сервере без дисплея: opencv-python-headless
+#  ultralytics>=8.1.0      # YOLOv8 (torch ставится автоматически как зависимость)
 #  mediapipe>=0.10.9
 #  numpy>=1.24
 #  ----------------------------------------------------------------------------------
@@ -33,6 +34,16 @@
 #
 #  4. Откройте в браузере на КОМПЬЮТЕРЕ:     http://127.0.0.1:5000
 #     (или http://localhost:5000). Если порт 5000 занят, укажите --port 5001.
+#
+#  4a. РЕАЛЬНЫЙ РЕЖИМ (КАМЕРА УСТРОЙСТВА): при первом открытии страницы появится
+#      экран «Разрешите доступ к камере» — нажмите кнопку, подтвердите запрос
+#      браузера (getUserMedia), и HUD будет строиться по ЖИВОМУ видео с камеры
+#      вашего устройства (ноутбука/телефона): детекция людей, статусы студентов,
+#      телеметрия. Кадры передаются на сервер (POST /api/push_frame), инференс и
+#      отрисовка HUD выполняются на Python, обратно приходит MJPEG-поток.
+#      Демо-сцена включается только если камеры нет или доступ запрещён.
+#      ВАЖНО: доступ к камере требует HTTPS или localhost. Если страница открыта
+#      во встроенном окне (iframe) — откройте её в отдельной вкладке браузера.
 #
 #  5. Как открыть на СМАРТФОНЕ / другом устройстве в той же Wi-Fi сети:
 #       a) Узнайте локальный IP компьютера:
@@ -450,28 +461,72 @@ class SyntheticScene:
 
 
 # ======================================================================================
+#  ОПИСАНИЕ ЛОГИКИ: БУФЕР КАДРОВ ИЗ БРАУЗЕРА (PushCameraBuffer)
+#  Реальная камера устройства (телефон/ноутбук) открывается САМ БРАУЗЕР через
+#  getUserMedia (пользователь видит стандартный запрос разрешения камеры), кадры
+#  сжимаются в JPEG на клиенте и отправляются POST-ом на /api/push_frame.
+#  Сервер складывает их в этот буфер, откуда их забирает ThreadedVideoCapture
+#  (источник 'browser') — дальше работает обычный конвейер: инференс + HUD + MJPEG.
+#  deque(maxlen=2) + Condition: всегда хранятся только самые свежие кадры.
+# ======================================================================================
+
+class PushCameraBuffer:
+    def __init__(self, maxlen: int = 2):
+        from collections import deque as _deque
+        self._frames = _deque(maxlen=maxlen)
+        self._cond = threading.Condition()
+        self.frames_received = 0
+        self.last_push = 0.0
+
+    def push(self, frame: np.ndarray) -> None:
+        with self._cond:
+            self._frames.append(frame)
+            self.frames_received += 1
+            self.last_push = time.time()
+            self._cond.notify_all()
+
+    def get(self, timeout: float = 1.0):
+        deadline = time.time() + timeout
+        with self._cond:
+            while not self._frames:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return None
+                self._cond.wait(remaining)
+            return self._frames.popleft()
+
+
+# ======================================================================================
 #  ОПИСАНИЕ ЛОГИКИ: ЗАХВАТ ВИДЕО В ОТДЕЛЬНОМ ПОТОКЕ (ThreadedVideoCapture)
 #  Всегда держит ОДИН самый свежий кадр (Queue(maxsize=1), старые отбрасываются),
 #  поэтому медленный инференс никогда не копит лаг. Поддерживает:
 #    --input 0                          → индекс локальной веб-камеры
 #    --input http://192.168.1.100:8080/video → MJPEG-поток приложения "IP Webcam"
-#    --input synth                       → встроенная демо-сцена
-#    --input file.mp4                    → видеофайл (зацикливается)
+#    --input browser                    → камера ЭТОГО устройства через браузер
+#                                         (getUserMedia + POST /api/push_frame)
+#    --input synth                      → встроенная демо-сцена (аварийный fallback)
+#    --input file.mp4                   → видеофайл (зацикливается)
 #  Смена источника на лету: метод switch() кладёт новый источник в очередь управления,
 #  поток захвата переоткрывает cv2.VideoCapture(...) без перезапуска сервера.
 # ======================================================================================
 
 class ThreadedVideoCapture(threading.Thread):
-    def __init__(self, source: str, width: int = 960, mode_provider=None):
+    def __init__(self, source: str, width: int = 960, mode_provider=None,
+                 push_buffer: PushCameraBuffer = None):
         super().__init__(daemon=True, name="ThreadedVideoCapture")
         self.source_raw = str(source)
         self.width = width
         self.mode_provider = mode_provider or (lambda: "vehicle")
+        self.push_buffer = push_buffer        # кадры, приходящие из браузера по HTTP
         self._cap = None
         self._frame_queue = None            # Queue(maxsize=1) — всегда самый свежий кадр
         self._pending_source = None         # источник, который нужно открыть на лету
         self._control_lock = threading.Lock()
         self.is_synthetic = True            # True, пока реальный источник не открыт
+        self.is_browser = False             # True — работаем на кадрах из браузера
+        self._browser_since = 0.0
+        self._browser_first_frame_logged = False
+        self._browser_stopped_logged = False
         self.active_source = "synth"        # что реально открыто сейчас
         self.resolution = (0, 0)
         self.fps_meter = FPSMeter(20)
@@ -485,6 +540,8 @@ class ThreadedVideoCapture(threading.Thread):
         s = str(src).strip()
         if s.lower() in ("synth", "synthetic", "demo", "test", ""):
             return "synth"
+        if s.lower() in ("browser", "web", "webcam-browser", "камера", "camera"):
+            return "browser"                # камера устройства через getUserMedia
         if re.fullmatch(r"\d+", s):
             return int(s)                   # индекс камеры: 0, 1, 2...
         return s                            # URL (http/rtsp) или путь к файлу
@@ -503,6 +560,7 @@ class ThreadedVideoCapture(threading.Thread):
                 return False
             self._cap = cap
             self.is_synthetic = False
+            self.is_browser = False
             self.active_source = str(src)
             h, w = frame.shape[:2]
             self.resolution = (w, h)
@@ -522,6 +580,10 @@ class ThreadedVideoCapture(threading.Thread):
 
         if src == "synth":
             self._enter_synthetic("synth (запрошен пользователем)")
+        elif src == "browser":
+            self._enter_browser()
+            event_bus.add("Ожидание кадров с камеры устройства (браузер) — "
+                          "разрешите доступ к камере на странице", level="info", code="SOURCE")
         else:
             if not self._open_real(src):
                 event_bus.add(
@@ -541,9 +603,12 @@ class ThreadedVideoCapture(threading.Thread):
             if pending is not None:
                 parsed = self.parse_source(pending)
                 if parsed == "synth":
-                    self._release_real()
                     self._enter_synthetic("synth (переключено пользователем)")
                     event_bus.add("Включена демо-сцена (synth)", level="info", code="SOURCE")
+                elif parsed == "browser":
+                    self._enter_browser()
+                    event_bus.add("Переключение на камеру устройства (браузер) — "
+                                  "ожидание разрешения и кадров", level="info", code="SOURCE")
                 else:
                     if self._open_real(parsed):
                         event_bus.add("Источник видео переключён: %s" % self.active_source,
@@ -554,7 +619,32 @@ class ThreadedVideoCapture(threading.Thread):
 
             # (2) читаем кадр
             frame = None
-            if self.is_synthetic:
+            if self.is_browser:
+                # ОПИСАНИЕ ЛОГИКИ: кадры приходят из браузера (POST /api/push_frame).
+                # Если за 10 секунд не пришло ни одного — возвращаем демо-сцену.
+                frame = self.push_buffer.get(timeout=0.5) if self.push_buffer else None
+                now = time.time()
+                if frame is not None:
+                    if not self._browser_first_frame_logged:
+                        self._browser_first_frame_logged = True
+                        self._browser_stopped_logged = False
+                        event_bus.add("Получены кадры с камеры устройства — реальный режим",
+                                      level="ok", code="SOURCE")
+                else:
+                    # кадры прекратились (вкладка закрыта / камера отключена) — логируем 1 раз
+                    if (self._browser_first_frame_logged and not self._browser_stopped_logged
+                            and self.push_buffer and self.push_buffer.last_push > 0
+                            and now - self.push_buffer.last_push > 5.0):
+                        self._browser_stopped_logged = True
+                        event_bus.add("Кадры с камеры устройства прекратились — ожидание "
+                                      "повторного включения камеры", level="warn", code="SOURCE")
+                if (frame is None and self.push_buffer is not None
+                        and self.push_buffer.frames_received == 0
+                        and now - self._browser_since > 10.0):
+                    event_bus.add("Кадры из браузера не поступили — возврат на демо-сцену. "
+                                  "Проверьте разрешение камеры и повторите.", level="warn", code="SOURCE")
+                    self._enter_synthetic("synth (fallback: браузер не передал кадры)")
+            elif self.is_synthetic:
                 mode = self.mode_provider()
                 if mode == "vehicle":
                     tele = self.telemetry_ref.get() if self.telemetry_ref else {}
@@ -613,10 +703,23 @@ class ThreadedVideoCapture(threading.Thread):
                 pass
         self._cap = None
         self.is_synthetic = True
+        self.is_browser = False
 
     def _enter_synthetic(self, label: str):
         self._release_real()
         self.active_source = label
+
+    def _enter_browser(self):
+        """Режим работы на кадрах, которые браузер присылает через /api/push_frame."""
+        self._release_real()
+        self.is_browser = True
+        self.is_synthetic = False
+        self._browser_since = time.time()
+        self._browser_first_frame_logged = False
+        self._browser_stopped_logged = False
+        if self.push_buffer is not None:
+            self.push_buffer.frames_received = 0
+        self.active_source = "browser (камера устройства)"
 
     def read(self, timeout: float = 1.5):
         """Забрать самый свежий кадр (блокирующе, с таймаутом)."""
@@ -729,12 +832,15 @@ class YOLOInference:
 
 class SyntheticDetector:
     """Fallback-детектор: возвращает «детекции» объектов, нарисованных демо-сценой.
-    Координаты и уверенность совпадают с тем, что реально видно в кадре."""
+    Координаты и уверенность совпадают с тем, что реально видно в кадре.
+    Работает ТОЛЬКО когда активна демо-сцена (иначе вернёт пустой список)."""
 
     def __init__(self, capture: ThreadedVideoCapture):
         self.capture = capture
 
     def detect(self) -> list:
+        if not self.capture.is_synthetic:
+            return []                       # реальное видео — синтетика недопустима
         objs = self.capture.last_scene_objects()
         out = []
         for o in objs:
@@ -744,21 +850,90 @@ class SyntheticDetector:
         return out
 
 
+class HOGPersonDetector:
+    """ОПИСАНИЕ ЛОГИКИ: РЕАЛЬНЫЙ fallback-детектор людей на встроенном HOG+SVM
+    (OpenCV, детектор «Default People»). Не требует скачивания моделей — работает
+    сразу, в том числе полностью офлайн. Применяется в режиме «Студенты», если
+    веса YOLOv8 недоступны. Точность ниже YOLO, зато детекции настоящие.
+    Кэш на 0.3 с: HOG на CPU медленный, конвейер не должен ждать каждый кадр."""
+
+    def __init__(self, resize_w: int = 480):
+        self.available = hasattr(cv2, "HOGDescriptor")
+        self.resize_w = resize_w
+        self._lock = threading.Lock()
+        self._cache = (0.0, [])
+        self._cache_ttl = 0.3
+        if self.available:
+            try:
+                self.hog = cv2.HOGDescriptor()
+                self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+            except Exception:
+                self.available = False
+
+    def detect_students(self, frame: np.ndarray) -> list:
+        if not self.available:
+            return []
+        now = time.time()
+        ts, cached = self._cache
+        if now - ts < self._cache_ttl:
+            return list(cached)
+        with self._lock:
+            h, w = frame.shape[:2]
+            k = self.resize_w / float(w)
+            small = cv2.resize(frame, (self.resize_w, max(2, int(round(h * k)))),
+                               interpolation=cv2.INTER_AREA)
+            try:
+                # winStride 4 и мелкий шаг масштаба: сидящие/частично видимые люди
+                # детектируются заметно лучше, скорость остаётся приемлемой (~0.2 с)
+                rects, weights = self.hog.detectMultiScale(
+                    small, hitThreshold=0.0, winStride=(4, 4), padding=(8, 8),
+                    scale=1.03)
+            except Exception:
+                return []
+            out = []
+            for (x, y, bw, bh), wt in zip(rects, weights):
+                conf = float(min(0.95, 0.55 + float(wt) * 0.15))
+                X1 = int(x / k); Y1 = int(y / k)
+                X2 = int((x + bw) / k); Y2 = int((y + bh) / k)
+                out.append(Detection(X1, Y1, X2, Y2, conf, "person"))
+            self._cache = (time.time(), out)
+            return list(out)
+
+
 class DetectorFacade:
     """ОПИСАНИЕ ЛОГИКИ: фасад выбирает источник детекций для каждого кадра:
-    реальная камера + доступная YOLO → настоящий инференс;
-    демо-сцена (или нет модели) → синтетические детекции сцены."""
+      1) демо-сцена                → синтетические детекции сцены (только для сцены);
+      2) реальное видео + YOLOv8   → настоящий инференс YOLOv8;
+      3) реальное видео без YOLO   → режим «Студенты»: встроенный HOG-детектор
+                                     людей OpenCV (реальный), «Автомобиль»: без рамок
+                                     (нужна обученная модель узлов — см. README)."""
 
-    def __init__(self, yolo: YOLOInference, synth: SyntheticDetector):
+    def __init__(self, yolo: YOLOInference, synth: SyntheticDetector,
+                 hog: HOGPersonDetector = None):
         self.yolo = yolo
         self.synth = synth
+        self.hog = hog
 
     def detect(self, frame: np.ndarray, mode: str, capture: ThreadedVideoCapture) -> list:
-        if capture.is_synthetic or not self.yolo.model_available:
+        if capture.is_synthetic:
             return self.synth.detect()
-        if mode == "vehicle":
-            return self.yolo.detect_vehicle(frame)
-        return self.yolo.detect_students(frame)
+        if self.yolo.model_available:
+            if mode == "vehicle":
+                return self.yolo.detect_vehicle(frame)
+            return self.yolo.detect_students(frame)
+        if mode == "student" and self.hog is not None and self.hog.available:
+            return self.hog.detect_students(frame)
+        return []
+
+    def describe(self, mode: str, capture: ThreadedVideoCapture) -> str:
+        """Человекочитаемое имя активного детектора — для чипа в веб-интерфейсе."""
+        if capture.is_synthetic:
+            return "DEMO-СЦЕНА"
+        if self.yolo.model_available:
+            return self.yolo.model_name
+        if mode == "student" and self.hog is not None and self.hog.available:
+            return "HOG-OpenCV (реальный)"
+        return "нет (нужна YOLO)"
 
 # ======================================================================================
 #  ОПИСАНИЕ ЛОГИКИ: АНАЛИЗ ПОЗ СТУДЕНТОВ (MediaPipe)
@@ -1358,12 +1533,18 @@ class OverlayRenderer:
         return img
 
     # ======================================================================
-    #  КАДР «НЕТ СИГНАЛА»
+    #  КАДР «НЕТ СИГНАЛА» (оживлённый: мигающая точка + счётчик секунд)
     # ======================================================================
+    _no_signal_tick = 0
+
     def draw_no_signal(self, w=960, h=540):
+        self._no_signal_tick += 1
         img = np.full((h, w, 3), C_BG, dtype=np.uint8)
         self._text(img, "NO SIGNAL", (w // 2 - 110, h // 2), 1.0, C_RED, 2)
-        self._text(img, "Waiting for video source...", (w // 2 - 120, h // 2 + 30), 0.5, C_DIM, 1)
+        self._text(img, "Waiting for video source... (%d sec)"
+                   % (self._no_signal_tick // 5), (w // 2 - 180, h // 2 + 30), 0.5, C_DIM, 1)
+        if self._no_signal_tick % 10 < 5:
+            cv2.circle(img, (w // 2, h // 2 - 60), 6, C_RED, -1, self.line)
         self._corner_brackets(img, 6, 6, w - 6, h - 6, C_EDGE, 22, 1)
         return img
 
@@ -1612,6 +1793,24 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     box-shadow:0 8px 30px rgba(0,0,0,.5);
   }
   .toast.show{transform:translateX(-50%) translateY(0)}
+  /* ---------- запрос разрешения камеры ---------- */
+  .cam-ask{position:absolute; inset:0; z-index:6; display:none; align-items:center;
+    justify-content:center; background:rgba(4,7,11,.88); padding:18px}
+  .cam-ask.show{display:flex}
+  .cam-card{max-width:440px; width:100%; background:var(--panel); border:1px solid var(--cyan);
+    border-radius:14px; padding:24px 20px; text-align:center;
+    box-shadow:0 0 44px rgba(34,211,238,.18)}
+  .cam-card .ico{font-size:36px; margin-bottom:6px}
+  .cam-card b{font-size:16.5px; display:block}
+  .cam-card p{font-size:12.5px; color:var(--dim); line-height:1.65; margin:10px 0 14px}
+  .cam-card .btn{margin:4px 3px; min-width:220px}
+  .cam-err{display:none; margin-top:12px; font-size:12px; color:var(--red);
+    border:1px solid rgba(248,113,113,.45); border-radius:8px; padding:8px 11px;
+    line-height:1.55; text-align:left}
+  .cam-err.show{display:block}
+  .cam-badge{position:absolute; left:12px; top:10px; font-family:var(--mono); font-size:11px;
+    color:#dff; background:rgba(10,14,18,.75); border:1px solid rgba(74,222,128,.55);
+    padding:4px 10px; border-radius:6px; display:none; z-index:4}
   @media (max-width:960px){
     main{grid-template-columns:1fr; padding:10px}
     header{padding:8px 10px; gap:8px}
@@ -1631,7 +1830,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   </div>
   <div class="chips">
     <span class="chip">FPS <b id="chip-fps">--</b></span>
-    <span class="chip">МОДЕЛЬ <b id="chip-model">--</b></span>
+    <span class="chip">КАМЕРА <b id="chip-cam">—</b></span>
+    <span class="chip">ДЕТЕКТОР <b id="chip-det">--</b></span>
     <span class="chip">ПОЗЫ <b id="chip-pose">--</b></span>
     <span class="chip">ИСТОЧНИК <b id="chip-src">--</b></span>
     <span class="chip">КЛИЕНТЫ <b id="chip-clients">--</b></span>
@@ -1643,12 +1843,31 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <section class="video-col">
     <div class="video-wrap" id="videoWrap">
       <img id="stream" src="/video_feed" alt="AI HUD видеопоток">
-      <div class="live-badge"><span class="r"></span>LIVE&nbsp;MJPEG</div>
+      <div class="live-badge"><span class="r"></span><span id="liveLabel">LIVE&nbsp;MJPEG</span></div>
+      <div class="cam-badge" id="camBadge">&#127909; КАМЕРА УСТРОЙСТВА · РЕАЛЬНЫЙ РЕЖИМ</div>
+
+      <!-- ЭКРАН ЗАПРОСА РАЗРЕШЕНИЯ КАМЕРЫ (показывается первым) -->
+      <div class="cam-ask" id="camAsk">
+        <div class="cam-card">
+          <div class="ico">&#127909;</div>
+          <b>Разрешите доступ к камере</b>
+          <p>HUD работает по <b>реальному видео</b> с камеры этого устройства:
+             люди, статусы, телеметрия — всё считается по живому кадру.
+             Нажмите кнопку и подтвердите доступ в запросе браузера.<br>
+             Демо-сцена — лишь запасной режим, если камеры нет.</p>
+          <button class="btn active" onclick="startBrowserCamera()">&#128247; Разрешить доступ к камере</button>
+          <button class="btn" onclick="dismissCamAsk()">Остаться в демо-режиме</button>
+          <div class="cam-err" id="camErr"></div>
+        </div>
+      </div>
+
       <div class="video-off" id="videoOff"><div>
         <b>Поток прерван</b><br>переподключение...
       </div></div>
     </div>
     <div class="video-tools">
+      <button class="btn" onclick="startBrowserCamera()">&#127909; Включить камеру</button>
+      <button class="btn" id="btnCamStop" onclick="stopBrowserCamera()" style="display:none">&#9209; Остановить камеру</button>
       <button class="btn" onclick="reconnectStream()">&#128260; Переподключить поток</button>
       <button class="btn" onclick="window.open('/api/snapshot','_blank')">&#128247; Снимок кадра</button>
       <button class="btn" onclick="toggleFullscreen()">&#9974; Во весь экран</button>
@@ -1666,10 +1885,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <button class="btn" onclick="setSource()">&#128279; Подключить</button>
         </div>
         <div class="src-quick">
-          <button class="btn" onclick="quickSrc('0')">&#128421; Веб-камера</button>
+          <button class="btn" onclick="startBrowserCamera()">&#127909; Камера устройства</button>
+          <button class="btn" onclick="quickSrc('0')">&#128421; Веб-камера ПК</button>
           <button class="btn" onclick="quickSrc('synth')">&#127760; Демо-сцена</button>
         </div>
-        <div class="hint">Телефон-камера: приложение <b>IP Webcam</b> (Android) → «Запустить сервер» →
+        <div class="hint"><b>Камера устройства</b> — браузер спросит разрешение (реальный режим).
+          <b>Веб-камера ПК</b> — камера, подключённая к серверу (для локального запуска).<br>
+          Телефон-камера: приложение <b>IP Webcam</b> (Android) → «Запустить сервер» →
           вставьте ссылку вида <code>http://192.168.1.100:8080/video</code>.<br>
           Источник меняется на лету, без перезапуска программы.</div>
       </div>
@@ -1735,17 +1957,134 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <script>
 "use strict";
 // ============================ ОПИСАНИЕ ЛОГИКИ (JS) ============================
-// 1) setMode()     — POST /api/mode: переключает сценарий инференса (vehicle/student).
-// 2) setSource()   — POST /api/source: смена источника видео на лету (веб-камера / IP-ссылка).
-// 3) pollState()   — GET /api/state раз в 1с: телеметрия, DTC, FPS, источник, клиенты.
-// 4) pollEvents()  — GET /api/events раз в 1.2с: журнал событий в боковую панель.
-// 5) pollStudents()— GET /api/students раз в 1.5с: рейтинг студентов (режим «Студенты»).
-// 6) Поток MJPEG   — <img src="/video_feed">; при обрыве авто-переподключение через 2с.
+// 1) startBrowserCamera() — ГЛАВНЫЙ поток реального режима: браузер показывает
+//    стандартный запрос разрешения камеры (getUserMedia); после разрешения кадры
+//    сжимаются в canvas (640px, ~12 к/с) и POST-ом уходят на /api/push_frame,
+//    сервер переключается на источник 'browser' и строит HUD по ЖИВОМУ видео.
+// 2) stopBrowserCamera()  — остановка камеры и возврат источника.
+// 3) setMode()            — POST /api/mode: переключает сценарий инференса.
+// 4) setSource()          — POST /api/source: смена источника (веб-камера ПК, IP-ссылка).
+// 5) pollState/Events/Students — периодический опрос JSON-API боковой панели.
+// 6) Поток MJPEG          — <img src="/video_feed">; при обрыве авто-переподключение.
 
 var lastEventId = 0;
 var lastMode = null;
+var camState = { stream: null, video: null, canvas: null, pushing: false, timer: null };
+var camDismissed = false;    // пользователь выбрал «Остаться в демо-режиме»
+var camAskShown = false;     // оверлей с вопросом уже показывался
+var CAM_SEND_W = 640;        // ширина кадра, отправляемого на сервер
+var CAM_FPS_MS = 83;         // интервал отправки (~12 кадров/с)
 
 function $(id){ return document.getElementById(id); }
+
+// ================== РЕАЛЬНАЯ КАМЕРА УСТРОЙСТВА (getUserMedia) ==================
+function camActive(){ return !!(camState.stream && camState.stream.active); }
+
+function showCamAsk(){ $('camAsk').classList.add('show'); }
+function hideCamAsk(){ $('camAsk').classList.remove('show'); }
+function dismissCamAsk(){ camDismissed = true; hideCamAsk(); toast('Демо-режим. Кнопка «Включить камеру» всегда доступна.'); }
+function showCamErr(msg){
+  var e = $('camErr'); e.innerHTML = msg; e.classList.add('show');
+  $('camAsk').classList.add('show');
+}
+
+function startBrowserCamera(){
+  hideCamAsk();
+  $('camErr').classList.remove('show');
+  if(camActive()){ toast('Камера уже активна'); return; }
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    showCamErr('Браузер не поддерживает доступ к камере. Откройте страницу по HTTPS '
+             + 'в актуальном Chrome / Safari / Firefox.');
+    return;
+  }
+  // ОПИСАНИЕ ЛОГИКИ: сначала браузер показывает запрос разрешения камеры.
+  navigator.mediaDevices.getUserMedia({
+    audio: false,
+    video: { width: { ideal: 1280 }, height: { ideal: 720 },
+             facingMode: { ideal: 'environment' } }   // на телефоне — задняя камера
+  }).then(function(stream){
+    camState.stream = stream;
+    var v = document.createElement('video');
+    v.muted = true; v.autoplay = true; v.playsInline = true;
+    v.setAttribute('playsinline', ''); v.setAttribute('muted', '');
+    v.srcObject = stream; v.style.display = 'none';
+    document.body.appendChild(v);
+    camState.video = v;
+    var p = v.play();
+    if(p && p.catch){ p.catch(function(){}); }
+    // сервер переключаем на источник 'browser' — конвейер ждёт наши кадры
+    fetch('/api/source', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: 'browser' }) }).catch(function(){});
+    camState.pushing = true;
+    setTimeout(camPushLoop, 350);
+    setCamUI(true);
+    toast('Камера подключена — реальный режим. Наведите на людей или узлы.');
+  }).catch(function(err){
+    setCamUI(false);
+    var msgs = {
+      NotAllowedError: 'Доступ к камере ЗАПРЕЩЁН. Нажмите на иконку камеры в адресной строке '
+        + 'браузера, выберите «Разрешить» и повторите. Если страница открыта во встроенном окне — '
+        + 'откройте её в отдельной вкладке браузера.',
+      PermissionDeniedError: 'Доступ к камере запрещён настройками браузера. Разрешите камеру '
+        + 'для этого сайта и повторите попытку.',
+      NotFoundError: 'Камера на этом устройстве не найдена. Проверьте подключение камеры.',
+      NotReadableError: 'Камера занята другим приложением. Закройте его и повторите.',
+      OverconstrainedError: 'Камера не поддерживает запрошенный режим. Попробуйте другую камеру.'
+    };
+    showCamErr(msgs[err.name] || ('Ошибка камеры: ' + (err.name || 'неизвестная') + '. '
+          + 'Откройте страницу в отдельной вкладке браузера и повторите.'));
+  });
+}
+
+// ОПИСАНИЕ ЛОГИКИ: цикл отправки кадров — видео → canvas (640px) → JPEG → POST
+function camPushLoop(){
+  if(!camState.pushing){ return; }
+  try{
+    var v = camState.video;
+    if(v && v.readyState >= 2 && v.videoWidth){
+      if(!camState.canvas){ camState.canvas = document.createElement('canvas'); }
+      var c = camState.canvas;
+      var k = CAM_SEND_W / v.videoWidth;
+      c.width = CAM_SEND_W;
+      c.height = Math.max(2, Math.round(v.videoHeight * k));
+      c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
+      c.toBlob(function(blob){
+        if(blob && camState.pushing){
+          fetch('/api/push_frame', { method: 'POST',
+            headers: { 'Content-Type': 'image/jpeg' }, body: blob }).catch(function(){});
+        }
+      }, 'image/jpeg', 0.65);
+    }
+  }catch(e){}
+  camState.timer = setTimeout(camPushLoop, CAM_FPS_MS);
+}
+
+function stopBrowserCamera(switchBack){
+  camState.pushing = false;
+  if(camState.timer){ clearTimeout(camState.timer); camState.timer = null; }
+  if(camState.stream){
+    try{ camState.stream.getTracks().forEach(function(t){ t.stop(); }); }catch(e){}
+    camState.stream = null;
+  }
+  if(camState.video){
+    try{ camState.video.srcObject = null; camState.video.remove(); }catch(e){}
+    camState.video = null;
+  }
+  setCamUI(false);
+  if(switchBack !== false){
+    fetch('/api/source', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: 'synth' }) }).catch(function(){});
+    toast('Камера остановлена — включена демо-сцена');
+  }
+}
+
+function setCamUI(on){
+  $('chip-cam').textContent = on ? 'АКТИВНА' : 'ВЫКЛ';
+  $('chip-cam').style.color = on ? '#4ade80' : '';
+  $('camBadge').style.display = on ? 'block' : 'none';
+  $('btnCamStop').style.display = on ? '' : 'none';
+  $('liveLabel').innerHTML = on ? '&#127909; КАМЕРА УСТРОЙСТВА' : 'LIVE&nbsp;MJPEG';
+}
 
 function toast(msg){
   var t = $('toast'); t.textContent = msg; t.classList.add('show');
@@ -1776,7 +2115,9 @@ function applyModeUI(m){
 // ---------- смена источника видео без перезапуска ----------
 function setSource(){
   var v = $('srcInput').value.trim();
-  if(!v){ toast('Введите источник: 0, synth или http://...:8080/video'); return; }
+  if(!v){ toast('Введите источник: browser, 0, synth или http://...:8080/video'); return; }
+  if(v.toLowerCase() === 'browser'){ startBrowserCamera(); return; }
+  stopBrowserCamera(false);   // уходим с камеры устройства — останавливаем захват
   fetch('/api/source', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -1786,7 +2127,10 @@ function setSource(){
   .then(function(d){ toast(d.ok ? 'Подключение: ' + d.source : d.error); })
   .catch(function(){ toast('Ошибка сети при смене источника'); });
 }
-function quickSrc(s){ $('srcInput').value = s; setSource(); }
+function quickSrc(s){
+  $('srcInput').value = s;
+  setSource();
+}
 
 // ---------- вкладки боковой панели ----------
 function showTab(t){
@@ -1818,10 +2162,20 @@ function toggleFullscreen(){
 function pollState(){
   fetch('/api/state').then(function(r){ return r.json(); }).then(function(s){
     $('chip-fps').textContent = s.pipeline_fps.toFixed(1);
-    $('chip-model').textContent = s.model;
+    $('chip-det').textContent = s.detector;
     $('chip-pose').textContent = s.pose_tier;
-    $('chip-src').textContent = s.source_synthetic ? 'DEMO-СЦЕНА' : s.source;
+    $('chip-src').textContent = s.source_synthetic ? 'DEMO-СЦЕНА' :
+      (s.browser && s.browser.active ? 'КАМЕРА УСТРОЙСТВА' : s.source);
     $('chip-clients').textContent = s.clients;
+    var camOn = !!(s.browser && s.browser.active);
+    if(camOn !== camActive()){
+      setCamUI(camOn);   // сервер подтвердил состояние камеры (например, другой клиент)
+    }
+    // ЭКРАН-ЗАПРОС КАМЕРЫ: показываем первым, пока сервер на демо-сцене
+    if(!camAskShown && !camDismissed && s.source_synthetic && !camOn){
+      camAskShown = true;
+      showCamAsk();
+    }
     var up = Math.floor(s.uptime_sec);
     $('uptime').textContent = 'UPTIME ' + Math.floor(up/3600) + 'ч ' +
       Math.floor(up%3600/60) + 'м ' + (up%60) + 'с';
@@ -1927,6 +2281,7 @@ _diagnostic = None
 _renderer = None
 _telemetry = None
 _pipeline = None
+_push_buffer = None
 _SERVER_URLS = []
 
 
@@ -1980,20 +2335,46 @@ def video_feed():
                     mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
+@app.route("/api/push_frame", methods=["POST"])
+def api_push_frame():
+    """ОПИСАНИЕ ЛОГИКИ: приём кадров с камеры устройства. Браузер после разрешения
+    доступа (getUserMedia) каждые ~80 мс отправляет JPEG-кадр телом запроса.
+    Декодируем и кладём в PushCameraBuffer — оттуда их забирает поток захвата
+    (источник 'browser'), дальше обычный конвейер: детекция → HUD → MJPEG."""
+    data = request.get_data(cache=False)
+    if not data:
+        return "", 400
+    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        return "", 400
+    if _push_buffer is not None:
+        _push_buffer.push(img)
+    return "", 204
+
+
 @app.route("/api/state")
 def api_state():
     """Снимок состояния для веб-интерфейса: режим, источник, FPS, телеметрия, DTC."""
     tele = _telemetry.get() if _telemetry else {"rpm": 0, "temp": 0, "vibration": 0}
     code, text, level = _diagnostic.current if _diagnostic else ("Normal", "", "ok")
+    browser_info = {
+        "active": bool(_capture.is_browser) if _capture else False,
+        "frames_received": _push_buffer.frames_received if _push_buffer else 0,
+        "last_frame_age": (round(time.time() - _push_buffer.last_push, 1)
+                           if _push_buffer and _push_buffer.last_push > 0 else None),
+    }
+    mode = app_state["mode"]
     return jsonify({
-        "mode": app_state["mode"],
+        "mode": mode,
         "source": _capture.active_source if _capture else "-",
         "source_synthetic": bool(_capture.is_synthetic) if _capture else True,
+        "browser": browser_info,
         "resolution": list(_capture.resolution) if _capture else [0, 0],
         "capture_fps": round(_capture.fps_meter.fps(), 1) if _capture else 0.0,
         "pipeline_fps": round(_pipeline.fps_meter.fps(), 1) if _pipeline else 0.0,
         "frame_id": _pipeline.frame_id if _pipeline else 0,
         "model": _detector.yolo.model_name if _detector else "-",
+        "detector": _detector.describe(mode, _capture) if _detector else "-",
         "pose_tier": _pose_analyzer.tier if _pose_analyzer else "-",
         "clients": app_state["clients"],
         "uptime_sec": int(time.time() - app_state["started"]),
@@ -2105,17 +2486,20 @@ def print_banner(args):
 
 
 def main():
-    global _capture, _detector, _pose_analyzer, _tracker, _diagnostic, _renderer, _telemetry, _pipeline
+    global _capture, _detector, _pose_analyzer, _tracker, _diagnostic, _renderer, _telemetry, _pipeline, _push_buffer
     args = build_arg_parser().parse_args()
     _SERVER_URLS.extend(_local_server_urls(args.port))
 
     # ---- создаём все компоненты системы ----
     _telemetry = VehicleTelemetry()                                   # OBD-II симулятор
+    _push_buffer = PushCameraBuffer()                                 # кадры из браузера
     _capture = ThreadedVideoCapture(args.input, width=args.width,
-                                    mode_provider=lambda: app_state["mode"])
+                                    mode_provider=lambda: app_state["mode"],
+                                    push_buffer=_push_buffer)
     _capture.telemetry_ref = _telemetry                               # сцене нужна телеметрия
     _yolo = YOLOInference(model_path=args.model, conf=args.conf)
-    _detector = DetectorFacade(_yolo, SyntheticDetector(_capture))
+    _hog = HOGPersonDetector()                                        # реальный fallback людей
+    _detector = DetectorFacade(_yolo, SyntheticDetector(_capture), _hog)
     _pose_analyzer = StudentPoseAnalyzer()
     _tracker = SimpleTracker()
     _diagnostic = VehicleDiagnostic()
