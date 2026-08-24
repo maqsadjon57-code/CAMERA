@@ -139,6 +139,16 @@ except Exception:
     mp = None
     MEDIAPIPE_AVAILABLE = False
 
+# ОПИСАНИЕ ЛОГИКИ: python-OBD — библиотека реальной автомобильной диагностики
+# через ELM327 (Bluetooth/WiFi/USB адаптер в разъёме OBD-II машины).
+# Если библиотека или адаптер отсутствуют — честно работаем в режиме симулятора.
+try:
+    import obd as pyobd
+    OBD_AVAILABLE = True
+except Exception:
+    pyobd = None
+    OBD_AVAILABLE = False
+
 # ======================================================================================
 #  ГЛОБАЛЬНАЯ КОНФИГУРАЦИЯ И СОСТОЯНИЕ ПРИЛОЖЕНИЯ
 # ======================================================================================
@@ -1287,6 +1297,183 @@ class SimpleTracker:
 
 
 # ======================================================================================
+#  ОПИСАНИЕ ЛОГИКИ: РЕАЛЬНАЯ АВТОДИАГНОСТИКА ЧЕРЕЗ ELM327 / OBD-II (RealOBD)
+#  ELM327 — недорогой адаптер (Bluetooth/WiFi/USB), который вставляется в
+#  диагностический разъём OBD-II автомобиля (под рулём, обычно слева).
+#  Подключаемся библиотекой python-OBD:
+#    Bluetooth Linux : /dev/rfcomm0      Windows: COM4, COM5...
+#    WiFi ELM327     : 192.168.0.10:35000
+#    USB             : /dev/ttyUSB0      или auto — поиск всех портов.
+#  Читаем ЖИВЫЕ данные: обороты (010C), температура ОЖ (0105), скорость (010D),
+#  нагрузка (0104), дроссель (0111) и РЕАЛЬНЫЕ коды ошибок GET_DTC (mode 03).
+#  Новые коды ошибок сразу попадают в журнал событий и на баннер HUD.
+# ======================================================================================
+
+class RealOBD:
+    """Менеджер реального OBD-II подключения (потокобезопасный).
+    Статусы: disconnected / connecting / connected / error."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._conn = None                  # obd.Async
+        self.status = "disconnected"
+        self.error = ""
+        self.target = None
+        self.data = {"rpm": None, "temp": None, "speed": None,
+                     "load": None, "throttle": None, "dtc": []}
+        self._known_dtc = set()
+
+    # ---------- подключение (асинхронно, чтобы не подвешивать веб-запрос) ----------
+    def connect(self, target: str):
+        if not OBD_AVAILABLE:
+            self.status = "error"
+            self.error = "библиотека obd не установлена (pip install obd)"
+            return
+        self.disconnect()
+        with self._lock:
+            self.status = "connecting"
+            self.error = ""
+            self.target = str(target)
+            self.data = {"rpm": None, "temp": None, "speed": None,
+                         "load": None, "throttle": None, "dtc": []}
+            self._known_dtc = set()
+        threading.Thread(target=self._do_connect, daemon=True,
+                         name="OBD-connect").start()
+
+    def _do_connect(self):
+        target = self.target
+        try:
+            port = "auto" if (not target or target.lower() in ("auto", "")) else target
+            conn = pyobd.Async(portstr=port, fast=False)
+            st = conn.status()
+            if st != pyobd.OBDStatus.CAR_CONNECTED:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                if st == pyobd.OBDStatus.NOT_CONNECTED:
+                    raise OSError("ELM327 не найден (нет доступных портов). "
+                                  "Для Bluetooth: сопрягите адаптер и укажите COM-порт "
+                                  "(Windows) или /dev/rfcomm0 (Linux); для WiFi укажите "
+                                  "IP:порт, например 192.168.0.10:35000")
+                raise OSError("ELM327 отвечает, но автомобиль не отвечает "
+                              "(проверьте: зажигание ВКЛЮЧЕНО, адаптер плотно в разъёме OBD-II)")
+            conn.watch(pyobd.commands.RPM, callback=self._mk_cb("rpm", float))
+            conn.watch(pyobd.commands.COOLANT_TEMP, callback=self._mk_cb("temp", float))
+            conn.watch(pyobd.commands.SPEED, callback=self._mk_cb("speed", float))
+            conn.watch(pyobd.commands.ENGINE_LOAD, callback=self._mk_cb("load", float))
+            conn.watch(pyobd.commands.THROTTLE_POS, callback=self._mk_cb("throttle", float))
+            conn.watch(pyobd.commands.GET_DTC, callback=self._on_dtc)
+            conn.start()
+            with self._lock:
+                self._conn = conn
+                self.status = "connected"
+            event_bus.add("OBD-II: подключено к автомобилю (%s) — телеметрия РЕАЛЬНАЯ" % target,
+                          level="ok", code="OBD")
+        except Exception as e:
+            with self._lock:
+                self.status = "error"
+                self.error = str(e) or type(e).__name__
+            event_bus.add("OBD-II: не удалось подключиться (%s). Проверьте адаптер ELM327, "
+                          "зажигание и адрес (например 192.168.0.10:35000 или COM4)."
+                          % self.error[:120], level="error", code="OBD")
+
+    def disconnect(self):
+        with self._lock:
+            conn, self._conn = self._conn, None
+            was_connected = self.status == "connected"
+            self.status = "disconnected"
+            self.error = ""
+        if was_connected:
+            event_bus.add("OBD-II отключён — возврат к симулятору телеметрии",
+                          level="info", code="OBD")
+        if conn is not None:
+            try:
+                conn.stop()
+                conn.close()
+            except Exception:
+                pass
+
+    # ---------- колбэки значений ----------
+    def _mk_cb(self, key, cast):
+        def cb(resp):
+            if resp is None or resp.is_null():
+                return
+            try:
+                v = resp.value.magnitude if hasattr(resp.value, "magnitude") else resp.value
+                with self._lock:
+                    self.data[key] = cast(v)
+            except Exception:
+                pass
+        return cb
+
+    def _on_dtc(self, resp):
+        """РЕАЛЬНЫЕ коды ошибок автомобиля (mode 03). Новый код → журнал + баннер."""
+        if resp is None or resp.is_null():
+            return
+        try:
+            codes = [(str(c.code), str(c.description or "")) for c in resp.value]
+        except Exception:
+            codes = []
+        with self._lock:
+            self.data["dtc"] = codes
+        current = {c[0] for c in codes}
+        fresh = [c for c in codes if c[0] not in self._known_dtc]
+        gone = [code for code in self._known_dtc if code not in current]
+        for code, desc in fresh:
+            event_bus.add("РЕАЛЬНЫЙ КОД ОШИБКИ %s — %s" % (code, desc or "смотрите расшифровку"),
+                          level="error", code=code)
+        for code in gone:
+            event_bus.add("Код %s больше не активен (сброшен/устранён)" % code,
+                          level="ok", code=code)
+        if fresh or gone:
+            self._known_dtc = current
+
+    # ---------- доступ ----------
+    def connected(self) -> bool:
+        with self._lock:
+            return self.status == "connected"
+
+    def get(self) -> dict:
+        with self._lock:
+            return dict(self.data)
+
+    def info(self) -> dict:
+        with self._lock:
+            return {"available": OBD_AVAILABLE, "status": self.status,
+                    "error": self.error, "target": self.target,
+                    "connected": self.status == "connected"}
+
+
+class TelemetryFacade:
+    """ОПИСАНИЕ ЛОГИКИ: выбирает источник телеметрии для HUD:
+    подключённый ELM327 (РЕАЛЬНЫЕ данные машины) либо симулятор (демо).
+    Поля speed/load/dtc есть только у реального источника."""
+
+    def __init__(self, simulator: VehicleTelemetry, real: RealOBD):
+        self.sim = simulator
+        self.real = real
+
+    def get(self) -> dict:
+        d = self.real.get()
+        if self.real.connected() and d.get("rpm") is not None:
+            return {
+                "real": True,
+                "rpm": int(round(d["rpm"] or 0)),
+                "temp": round(float(d["temp"] if d["temp"] is not None else 0.0), 1),
+                "vibration": None,                     # у OBD-II нет «вибрации» —
+                "speed": int(round(d["speed"] or 0)),  # вместо неё показываем LOAD
+                "load": round(float(d["load"] or 0.0), 1),
+                "throttle": round(float(d["throttle"] or 0.0), 1),
+                "dtc": d["dtc"],
+            }
+        sim = self.sim.get()
+        out = {"real": False, "speed": None, "load": None, "throttle": None, "dtc": []}
+        out.update(sim)
+        return out
+
+
+# ======================================================================================
 #  ОПИСАНИЕ ЛОГИКИ: ДИАГНОСТИКА АВТОМОБИЛЯ (VehicleDiagnostic)
 #  Конечный автомат по правилам задания:
 #    Belt_Pulley (conf > 80%) + вибрация > 0.9 → CHP-0402 | Bolt Wear Detected  [ERROR]
@@ -1308,22 +1495,42 @@ class VehicleDiagnostic:
             if d.label == "Belt_Pulley":
                 belt_conf = max(belt_conf, d.conf)
 
-        if belt_conf > 0.80 and telemetry["vibration"] > 0.9:
-            new = ("CHP-0402", "Bolt Wear Detected", "error")
-        elif telemetry["temp"] > 105.0:
-            new = ("CHP-0031", "Overheating Risk", "warn")
+        # ОПИСАНИЕ ЛОГИКИ: два режима диагностики.
+        # (1) РЕАЛЬНЫЙ (ELM327 подключён): статус определяется настоящими кодами
+        #     ошибок автомобиля (mode 03) и настоящей температурой ОЖ.
+        # (2) СИМУЛЯТОР (демо, адаптера нет): правила из задания (CHP-0402/CHP-0031).
+        if telemetry.get("real"):
+            dtc = telemetry.get("dtc") or []
+            if dtc:
+                code, desc = dtc[0]
+                extra = " (+%d)" % (len(dtc) - 1) if len(dtc) > 1 else ""
+                new = (code, (desc or "Fault code detected") + extra, "error")
+            elif telemetry["temp"] > 105.0:
+                new = ("CHP-0031", "Overheating Risk", "warn")
+            else:
+                new = ("Normal", "", "ok")
         else:
-            new = ("Normal", "", "ok")
+            if belt_conf > 0.80 and telemetry["vibration"] > 0.9:
+                new = ("CHP-0402", "Bolt Wear Detected", "error")
+            elif telemetry["temp"] > 105.0:
+                new = ("CHP-0031", "Overheating Risk", "warn")
+            else:
+                new = ("Normal", "", "ok")
 
         now = time.time()
         if new[:2] != self.current[:2]:
             if new[0] == "Normal":
                 event_bus.add("Диагностика: все системы в норме", level="ok", code="DTC")
-            else:
+            elif not telemetry.get("real"):
+                # реальный код DTC уже залогирован колбэком RealOBD —
+                # здесь сообщение только для симулятора/перегрева
                 event_bus.add("Диагностика: %s | %s (Belt conf %.0f%%, TEMP %.1f°C, VIB %.2f)"
                               % (new[0], new[1], belt_conf * 100, telemetry["temp"],
-                                 telemetry["vibration"]),
+                                 telemetry.get("vibration") or 0.0),
                               level=new[2], code=new[0])
+            elif new[0] == "CHP-0031":
+                event_bus.add("РЕАЛЬНАЯ температура ОЖ %.1f°C — риск перегрева!"
+                              % telemetry["temp"], level="warn", code=new[0])
             self._last_emit = now
         elif new[0] != "Normal" and now - self._last_emit > self.refresh:
             event_bus.add("Подтверждение: %s | %s остаётся активной" % (new[0], new[1]),
@@ -1455,25 +1662,47 @@ class OverlayRenderer:
         self._bar(img, bx, by + 32, bw2, bh, (temp - 60) / 60.0,
                   C_GREEN if temp < 100 else (C_YELLOW if temp <= 105 else C_RED))
 
-        vib = telemetry["vibration"]
-        self._text(img, "VIB", (px + 12, py + 108), 0.45, C_DIM, 1)
-        self._text(img, "%.2f" % vib, (px + 60, py + 110), 0.55,
-                   C_RED if vib > 0.9 else C_TEXT, 2)
-        # вибрация — сегментная шкала (10 сегментов)
-        seg_on = int(round(vib * 10))
-        for i in range(10):
-            sx = bx + i * 11
-            c = C_GREEN if i < 6 else (C_YELLOW if i < 9 else C_RED)
-            if i < seg_on:
-                cv2.rectangle(img, (sx, by + 60), (sx + 8, by + 74), c, -1, self.line)
-            else:
-                cv2.rectangle(img, (sx, by + 60), (sx + 8, by + 74), (45, 50, 60), 1, self.line)
+        vib = telemetry.get("vibration")
+        if vib is None:
+            # РЕАЛЬНЫЙ РЕЖИМ (ELM327): вместо синтетической вибрации — нагрузка и скорость
+            load = telemetry.get("load")
+            spd = telemetry.get("speed")
+            self._text(img, "LOAD", (px + 12, py + 108), 0.45, C_DIM, 1)
+            self._text(img, "%3.0f%%" % (load if load is not None else 0), (px + 60, py + 110),
+                       0.55, C_TEXT, 2)
+            self._bar(img, bx, by + 60, bw2, bh,
+                      ((load or 0.0) / 100.0),
+                      C_GREEN if (load or 0) < 80 else C_YELLOW)
+            if spd is not None:
+                self._text(img, "SPD %3d km/h" % spd, (bx, by + 92), 0.45, C_TEXT, 1)
+        else:
+            self._text(img, "VIB", (px + 12, py + 108), 0.45, C_DIM, 1)
+            self._text(img, "%.2f" % vib, (px + 60, py + 110), 0.55,
+                       C_RED if vib > 0.9 else C_TEXT, 2)
+            # вибрация — сегментная шкала (10 сегментов)
+            seg_on = int(round(vib * 10))
+            for i in range(10):
+                sx = bx + i * 11
+                c = C_GREEN if i < 6 else (C_YELLOW if i < 9 else C_RED)
+                if i < seg_on:
+                    cv2.rectangle(img, (sx, by + 60), (sx + 8, by + 74), c, -1, self.line)
+                else:
+                    cv2.rectangle(img, (sx, by + 60), (sx + 8, by + 74), (45, 50, 60), 1, self.line)
 
         belt = status.get("belt_conf", 0.0) * 100
         self._text(img, "BELT CONF: %2.0f%%" % belt, (px + 12, py + 152), 0.45,
                    C_YELLOW if belt > 80 else C_DIM, 1)
         self._text(img, "FPS %4.1f" % fps, (px + 130, py + 152), 0.45, C_DIM, 1)
-        self._text(img, "SCAN: LIVE  BUS: OK", (px + 12, py + 170), 0.45, C_DIM, 1)
+        if telemetry.get("real"):
+            # зелёная метка: данные настоящие, снятые с автомобиля
+            cv2.rectangle(img, (px + 12, py + 160), (px + 122, py + 174), (40, 90, 45), -1, self.line)
+            self._text(img, "OBD-II REAL", (px + 18, py + 171), 0.42, C_GREEN, 1)
+            dtc_n = len(telemetry.get("dtc") or [])
+            self._text(img, "DTC: %d" % dtc_n, (px + 130, py + 171), 0.45,
+                       C_RED if dtc_n else C_DIM, 1)
+        else:
+            self._text(img, "SCAN: LIVE  BUS: OK", (px + 12, py + 170), 0.45, C_DIM, 1)
+            self._text(img, "SIM", (px + 130, py + 170), 0.45, C_DIM, 1)
 
         # --- (2) рамки детекций узлов ---
         for d in detections:
@@ -1900,6 +2129,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <span class="chip">ДЕТЕКТОР <b id="chip-det">--</b></span>
     <span class="chip">ПОЗЫ <b id="chip-pose">--</b></span>
     <span class="chip">ИСТОЧНИК <b id="chip-src">--</b></span>
+    <span class="chip">OBD <b id="chip-obd">СИМ</b></span>
     <span class="chip">КЛИЕНТЫ <b id="chip-clients">--</b></span>
   </div>
 </header>
@@ -1963,9 +2193,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- Телеметрия (режим «Автомобиль») -->
+    <!-- Телеметрия (режим «Автомобиль»): РЕАЛЬНЫЙ OBD-II или симулятор -->
     <div class="card" id="teleCard">
-      <h3><span class="ind"></span>Телеметрия OBD-II</h3>
+      <h3><span class="ind"></span>Телеметрия OBD-II
+        <span class="chip" id="obdChip" style="margin-left:auto">СИМУЛЯТОР</span></h3>
       <div class="body">
         <div class="telemetry-grid">
           <div class="tele"><div class="lab">ОБОРОТЫ</div>
@@ -1974,10 +2205,24 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <div class="tele"><div class="lab">ТЕМП. °C</div>
             <div class="val" id="t-temp">--</div>
             <div class="gauge"><i id="g-temp"></i></div></div>
-          <div class="tele"><div class="lab">ВИБРАЦИЯ</div>
+          <div class="tele"><div class="lab" id="t-vib-lab">ВИБРАЦИЯ</div>
             <div class="val" id="t-vib">--</div>
             <div class="gauge"><i id="g-vib"></i></div></div>
         </div>
+        <!-- РЕАЛЬНАЯ диагностика: подключение ELM327 -->
+        <div class="src-row" style="margin-top:10px">
+          <input id="obdInput" placeholder="ELM327: auto | COM4 | 192.168.0.10:35000" spellcheck="false">
+          <button class="btn" onclick="setOBD()">&#128268; Подключить</button>
+        </div>
+        <div class="src-quick" style="margin-top:8px">
+          <button class="btn" onclick="quickOBD('auto')">&#128269; Автопоиск</button>
+          <button class="btn" onclick="quickOBD('192.168.0.10:35000')">&#128246; WiFi ELM327</button>
+          <button class="btn" onclick="quickOBD('off')">&#9209; Отключить</button>
+        </div>
+        <div class="hint" id="obdStatus">Симулятор: адаптер ELM327 не подключён. Для РЕАЛЬНОЙ
+          диагностики вставьте ELM327 в разъём OBD-II автомобиля (под рулём), включите
+          зажигание и нажмите «Подключить» (Bluetooth: COM4 / dev/rfcomm0, WiFi: IP:порт).</div>
+        <div id="dtcList"></div>
         <div class="dtc ok" id="dtcBox">NORMAL — все системы в норме</div>
       </div>
     </div>
@@ -2253,6 +2498,23 @@ function quickSrc(s){
   setSource();
 }
 
+// ---------- РЕАЛЬНАЯ диагностика OBD-II (ELM327) ----------
+function setOBD(){
+  var v = $('obdInput').value.trim() || 'auto';
+  fetch('/api/obd', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({target: v})
+  })
+  .then(function(r){ return r.json(); })
+  .then(function(d){
+    if(d.ok){ toast(v === 'off' ? 'OBD-II отключён — симулятор' : 'Подключение ELM327: ' + v); }
+    else { toast(d.error || 'Ошибка подключения OBD-II'); }
+  })
+  .catch(function(){ toast('Ошибка сети при подключении OBD-II'); });
+}
+function quickOBD(s){ $('obdInput').value = (s === 'off') ? '' : s; setOBD(); }
+
 // ---------- вкладки боковой панели ----------
 function showTab(t){
   $('tab-events').classList.toggle('active', t === 'events');
@@ -2320,19 +2582,70 @@ function pollState(){
       for(var i=0;i<s.server_urls.length;i++){ html += '<code>' + s.server_urls[i] + '</code> '; }
       $('phoneUrlInline').innerHTML = html;
     }
-    // телеметрия OBD-II
-    var rpm = s.telemetry.rpm, temp = s.telemetry.temp, vib = s.telemetry.vibration;
+    // телеметрия OBD-II (РЕАЛЬНАЯ с ELM327 или симулятор)
+    var isReal = !!s.telemetry.real;
+    var rpm = s.telemetry.rpm, temp = s.telemetry.temp;
     $('t-rpm').textContent = rpm;
     $('t-rpm').className = rpm > 4200 ? 'val crit' : (rpm > 3400 ? 'val warn' : 'val');
     $('g-rpm').style.width = Math.min(100, rpm/5000*100) + '%';
-    $('t-temp').textContent = temp.toFixed(1);
+    $('t-temp').textContent = temp.toFixed ? temp.toFixed(1) : temp;
     $('t-temp').className = temp > 105 ? 'val crit' : (temp > 100 ? 'val warn' : 'val');
     $('g-temp').style.width = Math.min(100, (temp-60)/55*100) + '%';
     $('g-temp').style.background = temp > 105 ? '#f87171' : (temp > 100 ? '#facc15' : '#4ade80');
-    $('t-vib').textContent = vib.toFixed(2);
-    $('t-vib').className = vib > 0.9 ? 'val crit' : (vib > 0.7 ? 'val warn' : 'val');
-    $('g-vib').style.width = Math.min(100, vib*100) + '%';
-    $('g-vib').style.background = vib > 0.9 ? '#f87171' : (vib > 0.7 ? '#facc15' : '#4ade80');
+    if(isReal){
+      // реальный режим: вместо вибрации — нагрузка двигателя
+      var load = s.telemetry.load || 0;
+      $('t-vib-lab').textContent = 'НАГРУЗКА %';
+      $('t-vib').textContent = load.toFixed ? load.toFixed(0) : load;
+      $('t-vib').className = load > 85 ? 'val crit' : (load > 70 ? 'val warn' : 'val');
+      $('g-vib').style.width = Math.min(100, load) + '%';
+      $('g-vib').style.background = load > 85 ? '#f87171' : (load > 70 ? '#facc15' : '#4ade80');
+    } else {
+      var vib = s.telemetry.vibration || 0;
+      $('t-vib-lab').textContent = 'ВИБРАЦИЯ';
+      $('t-vib').textContent = vib.toFixed ? vib.toFixed(2) : vib;
+      $('t-vib').className = vib > 0.9 ? 'val crit' : (vib > 0.7 ? 'val warn' : 'val');
+      $('g-vib').style.width = Math.min(100, vib*100) + '%';
+      $('g-vib').style.background = vib > 0.9 ? '#f87171' : (vib > 0.7 ? '#facc15' : '#4ade80');
+    }
+    // статус OBD-подключения
+    var obd = s.obd || {};
+    var stMap = {connected:['РЕАЛЬНЫЕ ДАННЫЕ','#4ade80'], connecting:['ПОДКЛЮЧЕНИЕ...','#facc15'],
+                 error:['ОШИБКА','#f87171'], disconnected:['СИМУЛЯТОР',''], off:['СИМУЛЯТОР','']};
+    var stt = stMap[obd.status] || ['СИМУЛЯТОР',''];
+    $('chip-obd').textContent = obd.status === 'connected' ? 'РЕАЛ' : 'СИМ';
+    $('chip-obd').style.color = obd.status === 'connected' ? '#4ade80' : '';
+    $('obdChip').textContent = stt[0];
+    $('obdChip').style.color = stt[1];
+    $('obdChip').style.borderColor = stt[1] || 'var(--line)';
+    var os = $('obdStatus');
+    if(obd.status === 'connected'){
+      os.innerHTML = '&#9989; <b>Подключено' + (obd.target ? ' (' + obd.target + ')' : '') +
+        '</b> — данные снимаются с автомобиля в реальном времени. Коды ошибок отображаются ' +
+        'в журнале и на баннере HUD.';
+    } else if(obd.status === 'connecting'){
+      os.innerHTML = '&#8987; Идёт подключение к ELM327 (зажигание должно быть включено)...';
+    } else if(obd.status === 'error'){
+      os.innerHTML = '&#10060; Не удалось подключиться: ' + (obd.error || '') +
+        '<br>Проверьте: адаптер в разъёме OBD-II, зажигание ВКЛ, сопряжение Bluetooth ' +
+        '(COM-порт) или адрес WiFi-адаптера.';
+    } else {
+      os.innerHTML = 'Симулятор: адаптер ELM327 не подключён. Для РЕАЛЬНОЙ диагностики ' +
+        'вставьте ELM327 в разъём OBD-II автомобиля (под рулём), включите зажигание и ' +
+        'нажмите «Подключить» (Bluetooth: COM4 / dev/rfcomm0, WiFi: IP:порт).';
+    }
+    // список реальных кодов ошибок
+    var dl = $('dtcList');
+    var dtc = (isReal && s.telemetry.dtc) ? s.telemetry.dtc : [];
+    if(dtc.length){
+      var html = '<div class="ev error" style="border-radius:8px;margin-top:8px">' +
+        '<span class="b"></span><div><b>Коды ошибок автомобиля (' + dtc.length + '):</b>';
+      for(var di=0; di<Math.min(dtc.length, 6); di++){
+        html += '<div class="c">' + dtc[di][0] + ' — ' + (dtc[di][1] || '') + '</div>';
+      }
+      html += '</div></div>';
+      dl.innerHTML = html;
+    } else { dl.innerHTML = ''; }
     // статус диагностики
     var dtc = $('dtcBox');
     if(s.vehicle_status.code === 'Normal'){
@@ -2457,6 +2770,8 @@ _tracker = None
 _diagnostic = None
 _renderer = None
 _telemetry = None
+_telemetry_facade = None
+_real_obd = None
 _pipeline = None
 _push_buffer = None
 _SERVER_URLS = []
@@ -2813,10 +3128,29 @@ def api_push_frame():
     return "", 204
 
 
+@app.route("/api/obd", methods=["POST"])
+def api_obd():
+    """ОПИСАНИЕ ЛОГИКИ: подключение РЕАЛЬНОГО OBD-II адаптера ELM327 на лету.
+    Тело: {"target": "auto" | "COM4" | "/dev/rfcomm0" | "192.168.0.10:35000"}
+    или   {"target": "off"} — отключить и вернуться к симулятору."""
+    data = request.get_json(silent=True) or {}
+    target = str(data.get("target", "")).strip()
+    if _real_obd is None:
+        return jsonify({"ok": False, "error": "OBD-модуль не инициализирован"}), 500
+    if target.lower() in ("off", "disconnect", "стоп"):
+        _real_obd.disconnect()
+        return jsonify({"ok": True, "obd": _real_obd.info()})
+    if not OBD_AVAILABLE:
+        return jsonify({"ok": False, "obd": _real_obd.info(),
+                        "error": "Библиотека obd не установлена: pip install obd"}), 400
+    _real_obd.connect(target or "auto")
+    return jsonify({"ok": True, "obd": _real_obd.info()})
+
+
 @app.route("/api/state")
 def api_state():
     """Снимок состояния для веб-интерфейса: режим, источник, FPS, телеметрия, DTC."""
-    tele = _telemetry.get() if _telemetry else {"rpm": 0, "temp": 0, "vibration": 0}
+    tele = _telemetry_facade.get() if _telemetry_facade else {"rpm": 0, "temp": 0, "vibration": 0}
     code, text, level = _diagnostic.current if _diagnostic else ("Normal", "", "ok")
     browser_info = {
         "active": bool(_capture.is_browser) if _capture else False,
@@ -2838,6 +3172,7 @@ def api_state():
         "model": _detector.yolo.model_name if _detector else "-",
         "detector": _detector.describe(mode, _capture) if _detector else "-",
         "pose_tier": _pose_analyzer.tier if _pose_analyzer else "-",
+        "obd": _real_obd.info() if _real_obd else {"available": False, "status": "off"},
         "clients": app_state["clients"],
         "uptime_sec": int(time.time() - app_state["started"]),
         "telemetry": tele,
@@ -2924,6 +3259,9 @@ def build_arg_parser():
     p.add_argument("--conf", type=float, default=0.35, help="порог уверенности детекции (0..1)")
     p.add_argument("--width", type=int, default=960, help="рабочая ширина кадра HUD")
     p.add_argument("--max-fps", type=int, default=24, help="ограничение FPS конвейера")
+    p.add_argument("--obd", default="",
+                   help="РЕАЛЬНАЯ диагностика ELM327: auto | COM4 | /dev/rfcomm0 | "
+                        "192.168.0.10:35000 (иначе — симулятор телеметрии)")
     p.add_argument("--https", action="store_true",
                    help="поднять HTTPS с самоподписанным сертификатом — нужен, чтобы "
                         "камера телефона работала при открытии страницы по Wi-Fi (http://IP)")
@@ -2940,6 +3278,11 @@ def print_banner(args):
                                     else "модель НЕ загружена — работает синтетический детектор"))
     print("  MediaPipe      : %s" % ("доступен (уровень: %s)" % _pose_analyzer.tier
                                     if MEDIAPIPE_AVAILABLE else "НЕ доступен (эвристика)"))
+    print("  OBD-II (ELM327): %s" % ("библиотека готова — подключите адаптер кнопкой "
+                                     "«Подключить» в панели телеметрии%s"
+                                     % ((", автозапуск: " + args.obd) if args.obd else "")
+                                     if OBD_AVAILABLE else "библиотека obd НЕ установлена — "
+                                     "симулятор телеметрии (pip install obd)"))
     print("-" * 78)
     print("  ОТКРЫТЬ В БРАУЗЕРЕ НА КОМПЬЮТЕРЕ:  http://127.0.0.1:%d" % args.port)
     for u in _SERVER_URLS:
@@ -2951,13 +3294,15 @@ def print_banner(args):
 
 
 def main():
-    global _capture, _detector, _pose_analyzer, _tracker, _diagnostic, _renderer, _telemetry, _pipeline, _push_buffer, _REPO_URL
+    global _capture, _detector, _pose_analyzer, _tracker, _diagnostic, _renderer, _telemetry, _telemetry_facade, _real_obd, _pipeline, _push_buffer, _REPO_URL
     args = build_arg_parser().parse_args()
     _SERVER_URLS.extend(_local_server_urls(args.port))
     _REPO_URL = _detect_repo_url()      # для QR «код проекта» (работает отовсюду)
 
     # ---- создаём все компоненты системы ----
-    _telemetry = VehicleTelemetry()                                   # OBD-II симулятор
+    _telemetry = VehicleTelemetry()                                   # симулятор OBD-II (демо)
+    _real_obd = RealOBD()                                             # РЕАЛЬНЫЙ OBD-II (ELM327)
+    _telemetry_facade = TelemetryFacade(_telemetry, _real_obd)        # выбор источника
     _push_buffer = PushCameraBuffer()                                 # кадры из браузера
     _capture = ThreadedVideoCapture(args.input, width=args.width,
                                     mode_provider=lambda: app_state["mode"],
@@ -2971,12 +3316,20 @@ def main():
     _diagnostic = VehicleDiagnostic()
     _renderer = OverlayRenderer()
     _pipeline = HUDPipeline(_capture, _detector, _pose_analyzer, _tracker,
-                            _diagnostic, _renderer, _telemetry, max_fps=args.max_fps)
+                            _diagnostic, _renderer, _telemetry_facade, max_fps=args.max_fps)
 
     # ---- запускаем фоновые потоки: телеметрия, захват, конвейер HUD ----
     _telemetry.start()
     _capture.start()
     _pipeline.start()
+
+    # автоподключение реального OBD-II, если указан --obd
+    if args.obd:
+        if OBD_AVAILABLE:
+            _real_obd.connect(args.obd)
+        else:
+            event_bus.add("Флаг --obd задан, но библиотека obd не установлена "
+                          "(pip install obd) — работает симулятор", level="warn", code="OBD")
 
     event_bus.add("Сервер AI HUD запущен (порт %d)" % args.port, level="ok", code="SYSTEM")
     event_bus.add("Источник при старте: %s" % args.input, level="info", code="SOURCE")
