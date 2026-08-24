@@ -2276,6 +2276,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             <code>https://IP:5000</code> (подтвердите исключение для сертификата).<br>
             • Кнопка «Разрешить доступ к камере» включит живое видео с камеры телефона.<br><br>
             <b>Вариант 2 — сервер прямо НА телефоне (Termux, Android):</b><br>
+            🍎 <b>iPhone:</b> запуск сервера на iOS Apple запрещает — используйте
+            облачный запуск Render (см. README) или компьютер рядом.<br>
             1. Установите <b>Termux</b> (из F-Droid) и скопируйте папку проекта на телефон.<br>
             2. В Termux: <code>bash run_phone.sh</code> — поставит зависимости и запустит сервер.<br>
             3. Откройте в браузере телефона <code>http://127.0.0.1:5000</code> — это localhost,
@@ -2796,14 +2798,12 @@ def _local_server_urls(port: int) -> list:
 
 
 def _request_is_local() -> bool:
-    """ОПИСАНИЕ ЛОГИКИ: страница открыта на этой же машине (localhost/локальный IP)?
-    Если НЕТ — мы в облачной песочнице/прокси (например *.e2b.app): такой адрес
-    защищён токеном доступа, с телефона его не открыть, QR бесполезен, service
-    worker не нужен. Флаг уходит в /api/state, фронтенд адаптирует подсказки."""
-    host = (request.host or "").split(":")[0]
-    if host == "localhost" or host.startswith("127.") or host.startswith("0.0.0.0"):
-        return True
-    return bool(re.match(r"^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)", host))
+    """ОПИСАНИЕ ЛОГИКИ: страница открыта в защищённом превью платформы Arena
+    (*.e2b.app — адрес подписывается токеном доступа, с телефона его не открыть)?
+    Прочие адреса — нормальные развёртывания: localhost/LAN (свой ПК) или облачный
+    хостинг (Render и т.п., HTTPS) — там QR и камера работают как обычно."""
+    host = (request.host or "").split(":")[0].lower()
+    return not (host.endswith(".e2b.app") or host.endswith(".e2b.dev"))
 
 
 @app.route("/")
