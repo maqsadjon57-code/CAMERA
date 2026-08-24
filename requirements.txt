@@ -1,0 +1,11 @@
+# ============================================================
+#  AI HUD Web Application — requirements.txt
+#  Установка:  pip install -r requirements.txt
+#  Python 3.10+
+# ============================================================
+
+flask>=3.0
+opencv-python>=4.8        # на сервере без монитора: opencv-python-headless>=4.8
+ultralytics>=8.1.0        # YOLOv8 (torch и torchvision установятся автоматически)
+mediapipe>=0.10.9
+numpy>=1.24

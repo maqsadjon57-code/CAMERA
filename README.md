@@ -1,1 +1,99 @@
-# arbitrage-win-rate-90%
+# 🖥️ AI HUD — Real-Time Computer Vision Web Application
+
+Полнофункциональный веб-сервис **Real-Time AI HUD**: рендеринг HUD-оверлеев выполняется
+на стороне Python (OpenCV), а в браузер отдаётся **MJPEG-поток** готовых кадров.
+Веб-интерфейс (HTML/CSS/JS, встроен в `app.py`) работает на компьютере и на смартфоне.
+
+| Сценарий | Что делает |
+|---|---|
+| 🚗 **Автомобиль** (vehicle) | Телеметрия OBD-II (RPM 800–5000, температура 80–115 °C, вибрация 0.0–1.0), детекция узлов (`Engine_Block`, `Belt_Pulley`, `Dashboard`, `Check_Engine_Light`), диагностика: `CHP-0402 Bolt Wear Detected` (Belt_Pulley conf > 80 % + вибрация > 0.9) и `CHP-0031 Overheating Risk` (t > 105 °C). Журнал ошибок — в боковой панели. |
+| 🎓 **Студенты** (student) | Детекция людей (YOLOv8, класс 0), анализ поз (MediaPipe: наклон головы, поднятая рука). Классификация: `Actively Participating` / `Distracted` / `Confused` / `Focused`. Стабильные ID (`STD-0001`…), `PRED. SCORE` 0–100 и рейтинг активности в боковой панели. |
+
+## 🚀 Быстрый старт
+
+```bash
+# 1. Установить зависимости (Python 3.10+)
+pip install -r requirements.txt
+
+# 2. Запустить (по умолчанию --input 0 — веб-камера)
+python app.py
+python app.py --input 0                          # веб-камера
+python app.py --input http://192.168.1.100:8080/video   # IP-камера смартфона
+python app.py --input synth                      # встроенная демо-сцена (без камеры)
+
+# 3. Открыть в браузере на компьютере
+#    http://127.0.0.1:5000
+```
+
+## 📱 Как открыть с телефона
+
+1. Узнайте IP компьютера: Windows — `ipconfig`, Linux/macOS — `ip addr`.
+2. Запустите `python app.py --host 0.0.0.0` (по умолчанию уже так).
+3. На телефоне (та же Wi-Fi сеть) откройте `http://<IP-компьютера>:5000`,
+   например `http://192.168.1.5:5000`.
+4. Если не открывается — разрешите порт 5000 в брандмауэре (Windows, cmd от админа):
+   `netsh advfirewall firewall add rule name="AI HUD" dir=in action=allow protocol=TCP localport=5000`
+
+## 📹 Телефон как IP-камера
+
+1. Установите **«IP Webcam»** (Google Play, автор Pavel Khlebovich); аналог для iOS — iVCam / DroidCam.
+2. Телефон и компьютер — в одной Wi-Fi сети.
+3. В приложении нажмите «Запустить сервер» — на экране появится адрес, например `http://192.168.1.100:8080`.
+4. Вставьте `http://192.168.1.100:8080/video` в поле **«Источник видео»** на странице и нажмите
+   **«Подключить»** — источник сменится **без перезапуска** программы.
+
+## 🌐 Веб-интерфейс
+
+- Основная область — живой MJPEG-поток (`<img src="/video_feed">`), кнопки «Переподключить поток»,
+  «Снимок кадра», «Во весь экран».
+- Кнопки **«Автомобиль» / «Студенты»** — мгновенное переключение логики инференса (POST `/api/mode`).
+- Боковая панель: источник видео, телеметрия OBD-II с индикаторами, **журнал событий**,
+  **рейтинг студентов**, справка. На экранах уже 960 px панель переезжает под видео (mobile-friendly).
+
+## 🔌 REST API
+
+| Метод | Endpoint | Описание |
+|---|---|---|
+| GET | `/` | Веб-интерфейс |
+| GET | `/video_feed` | MJPEG-поток HUD |
+| GET | `/api/state` | Режим, источник, FPS, телеметрия, статус DTC |
+| GET | `/api/events?limit=40` | Журнал событий |
+| GET | `/api/students` | Рейтинг студентов |
+| GET | `/api/snapshot` | JPEG-снимок текущего кадра |
+| POST | `/api/mode` | `{"mode": "vehicle" \| "student"}` |
+| POST | `/api/source` | `{"source": "0" \| "synth" \| "http://..."}` |
+
+## 🏗️ Архитектура (все потоки не блокируют друг друга)
+
+```
+VehicleTelemetry ─┐                       ┌─► EventBus ──► /api/events
+(поток, 0.12 c)   ├─► HUDPipeline ─► JPEG ─┤
+ThreadedVideo     │   (YOLOv8 + MediaPipe  └─► /video_feed (MJPEG, все клиенты)
+Capture (поток) ──┘   + рендер HUD)            читают один и тот же буфер
+Queue(maxsize=1): всегда самый свежий кадр, старые отбрасываются (anti-lag)
+```
+
+Классы: `ThreadedVideoCapture`, `YOLOInference` (+`SyntheticDetector` fallback),
+`TelemetrySimulator`/`VehicleTelemetry`, `OverlayRenderer`, `StudentPoseAnalyzer`,
+`SimpleTracker`, `VehicleDiagnostic`, `HUDPipeline`, `EventBus`.
+
+**Graceful degradation:** если веб-камера недоступна — включается встроенная синтетическая
+демо-сцена (моторный отсек / аудитория); если модель YOLOv8 не скачалась (нет интернета) —
+работает синтетический детектор; если MediaPipe недоступен — эвристический анализ поз.
+Приложение остаётся полностью работоспособным в любом окружении.
+
+> ⚠️ Классы `Engine_Block / Belt_Pulley / Dashboard / Check_Engine_Light` отсутствуют в
+> предобученной COCO-модели: в демо их метки отображаются на словарь из задания, для боевого
+> применения дообучите YOLOv8 на собственном датасете (data.yaml с этими 4 классами).
+
+## ⚙️ Параметры запуска
+
+```
+--input    источник: 0 | http://.../video | synth | video.mp4   (по умолчанию 0)
+--host     адрес сервера, по умолчанию 0.0.0.0 (доступ с телефона)
+--port     порт, по умолчанию 5000
+--model    yolov8n.pt / yolov8s.pt ...
+--conf     порог уверенности детекции (0.35)
+--width    рабочая ширина кадра (960)
+--max-fps  ограничение FPS конвейера (24)
+```
