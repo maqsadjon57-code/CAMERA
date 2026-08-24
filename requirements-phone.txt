@@ -1,0 +1,19 @@
+# ============================================================
+#  ЛЁГКИЙ НАБОР ДЛЯ ЗАПУСКА НА ТЕЛЕФОНЕ (Termux / Pydroid 3)
+#  Всё тяжёлое (YOLOv8/torch, MediaPipe) — НЕОБЯЗАТЕЛЬНО:
+#  без них работают встроенный HOG-детектор людей (OpenCV)
+#  и эвристический анализ поз. Этого достаточно для режимов
+#  «Студенты» и «Автомобиль» (телеметрия/диагностика).
+#
+#  Termux (Android):  bash run_phone.sh  — поставит всё сам
+#  Pydroid 3:         установите Flask и OpenCV из репозитория Pydroid,
+#                     затем pip install -r requirements-phone.txt
+# ============================================================
+
+flask>=3.0
+numpy>=1.24
+qrcode>=7.4
+# OpenCV — ОБЯЗАТЕЛЬНО ветка 4.x (в 5.x убран HOG-детектор людей):
+#   Termux:  pkg install opencv-python
+#   pip:     pip install "opencv-python-headless>=4.8,<5"
+opencv-python-headless>=4.8,<5

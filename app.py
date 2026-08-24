@@ -12,7 +12,10 @@
 #  ultralytics>=8.1.0      # YOLOv8 (torch ставится автоматически как зависимость)
 #  mediapipe>=0.10.9
 #  numpy>=1.24
+#  qrcode>=7.4             # QR-код адреса для телефона (необязательно)
 #  ----------------------------------------------------------------------------------
+#  Для запуска НА ТЕЛЕФОНЕ (Termux/Pydroid) используйте requirements-phone.txt:
+#  только flask + numpy + qrcode (+ opencv из репозитория Termux) — без ML-библиотек.
 #  Установка:  pip install -r requirements.txt
 #
 #  ============================== ИНСТРУКЦИЯ ПО ЗАПУСКУ (RU) =========================
@@ -44,6 +47,22 @@
 #      Демо-сцена включается только если камеры нет или доступ запрещён.
 #      ВАЖНО: доступ к камере требует HTTPS или localhost. Если страница открыта
 #      во встроенном окне (iframe) — откройте её в отдельной вкладке браузера.
+#
+#  4b. ЗАПУСК НА ТЕЛЕФОНЕ — три способа:
+#      (1) УСТАНОВИТЬ КАК ПРИЛОЖЕНИЕ (PWA): откройте страницу → меню браузера →
+#          «Установить приложение» (Android) или «На экран Домой» (iOS).
+#          Приложение откроется на весь экран, без адресной строки.
+#      (2) СЕРВЕР НА ПК, ТЕЛЕФОН — КЛИЕНТ: телефон и компьютер в одной Wi-Fi,
+#          откройте http://<IP-компьютера>:5000 (см. QR-код в боковой панели).
+#          Чтобы КАМЕРА телефона работала по Wi-Fi, нужен защищённый контекст:
+#          запустите  python app.py --https  и откройте https://<IP>:5000
+#          (браузер предупредит о самоподписанном сертификате — подтвердите).
+#      (3) СЕРВЕР ПРЯМО НА ТЕЛЕФОНЕ (Termux, Android): установите Termux (F-Droid),
+#          скопируйте папку проекта на телефон и выполните:  bash run_phone.sh
+#          Затем откройте в браузере телефона http://127.0.0.1:5000 — localhost,
+#          камера работает сразу. Тяжёлые библиотеки (YOLO/MediaPipe) не нужны:
+#          достаточно flask + opencv + numpy (см. requirements-phone.txt),
+#          детекция людей — встроенным HOG-детектором OpenCV.
 #
 #  5. Как открыть на СМАРТФОНЕ / другом устройстве в той же Wi-Fi сети:
 #       a) Узнайте локальный IP компьютера:
@@ -87,6 +106,7 @@ import os
 import random
 import re
 import socket
+import subprocess
 import threading
 import time
 import urllib.request
@@ -214,6 +234,38 @@ class EventBus:
 
 
 event_bus = EventBus()
+
+# ======================================================================================
+#  ОПИСАНИЕ ЛОГИКИ: PWA-ИКОНКА ПРИЛОЖЕНИЯ (генерируется OpenCV на лету)
+#  Чтобы страницу можно было установить на телефон как приложение («На экран Домой» /
+#  «Установить приложение»), нужны иконки 192/512 px + manifest.json + service worker.
+#  Рисуем логотип (кольцо объектива + HUD-уголки + REC-точка) без внешних файлов.
+# ======================================================================================
+
+_ICON_CACHE = {}
+
+def generate_icon_png(size: int) -> bytes:
+    """Рисует квадратную PNG-иконку приложения (full-bleed, безопасная зона ~70%)."""
+    size = int(size)
+    if size in _ICON_CACHE:
+        return _ICON_CACHE[size]
+    s = size
+    img = np.full((s, s, 3), (14, 15, 11), dtype=np.uint8)   # фон #0b0f14 (BGR)
+    cyan, red, white = (80, 190, 235), (255, 60, 60), (240, 235, 230)
+    c = s // 2
+    r = int(s * 0.30)
+    cv2.circle(img, (c, c), r, cyan, max(3, int(s * 0.045)), cv2.LINE_AA)
+    cv2.circle(img, (c, c), int(r * 0.45), cyan, max(2, int(s * 0.022)), cv2.LINE_AA)
+    cv2.circle(img, (c, c), int(r * 0.12), white, -1, cv2.LINE_AA)
+    m, ln, th = int(s * 0.17), int(s * 0.13), max(3, int(s * 0.035))
+    for (px, py, sx, sy) in ((m, m, 1, 1), (s - m, m, -1, 1), (m, s - m, 1, -1), (s - m, s - m, -1, -1)):
+        cv2.line(img, (px, py), (px + sx * ln, py), cyan, th, cv2.LINE_AA)
+        cv2.line(img, (px, py), (px, py + sy * ln), cyan, th, cv2.LINE_AA)
+    cv2.circle(img, (int(s * 0.77), int(s * 0.25)), int(s * 0.045), red, -1, cv2.LINE_AA)
+    ok, buf = cv2.imencode(".png", img)
+    data = buf.tobytes() if ok else b""
+    _ICON_CACHE[size] = data
+    return data
 
 # ======================================================================================
 #  ОПИСАНИЕ ЛОГИКИ: ТЕЛЕМЕТРИЯ (OBD-II симулятор)
@@ -1660,6 +1712,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
 <title>AI HUD — Real-Time Computer Vision Overlay</title>
+<!-- PWA: установка на телефон как приложение («Установить приложение» / «На экран Домой») -->
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#0b0f14">
+<link rel="icon" type="image/png" sizes="192x192" href="/icon/192.png">
+<link rel="apple-touch-icon" href="/icon/180.png">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="AI HUD">
 <style>
   :root{
     --bg:#0b0f14; --panel:#121820; --panel2:#0e141b; --line:#22303e;
@@ -1928,14 +1989,47 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       </div>
     </div>
 
+    <!-- Телефон: установка как приложение + QR + запуск на телефоне -->
+    <div class="card">
+      <h3><span class="ind"></span>Телефон</h3>
+      <div class="body">
+        <button class="btn active" id="btnInstall" style="display:none;width:100%"
+                onclick="installApp()">&#128193; Установить как приложение</button>
+        <div id="qrBox" style="text-align:center;margin:10px 0 4px">
+          <img id="qrImg" src="/qr.svg" alt="QR-код: адрес сервера"
+               style="width:148px;height:148px;background:#fff;padding:6px;border-radius:8px"
+               onerror="this.parentNode.style.display='none'">
+          <div class="hint" style="margin-top:6px">Отсканируйте камерой телефона — откроется приложение</div>
+        </div>
+        <details class="help" open>
+          <summary>&#9432; Как открыть / запустить на телефоне</summary>
+          <div class="body">
+            <b>Вариант 1 — телефон как клиент (сервер на ПК):</b><br>
+            Телефон и компьютер в одной Wi-Fi. Откройте адрес компьютера
+            <span id="phoneUrlInline">— определяется автоматически —</span><br>
+            • Без HTTPS страница работает, но <b>камера телефона</b> доступна только по
+            HTTPS/localhost: запустите <code>python app.py --https</code> и откройте
+            <code>https://IP:5000</code> (подтвердите исключение для сертификата).<br>
+            • Кнопка «Разрешить доступ к камере» включит живое видео с камеры телефона.<br><br>
+            <b>Вариант 2 — сервер прямо НА телефоне (Termux, Android):</b><br>
+            1. Установите <b>Termux</b> (из F-Droid) и скопируйте папку проекта на телефон.<br>
+            2. В Termux: <code>bash run_phone.sh</code> — поставит зависимости и запустит сервер.<br>
+            3. Откройте в браузере телефона <code>http://127.0.0.1:5000</code> — это localhost,
+            камера работает сразу (без HTTPS).<br>
+            4. Меню браузера → «Установить приложение» — AI HUD станет полноценным
+            приложением на главном экране.<br><br>
+            <b>Установка как приложение:</b> Chrome/Android — меню ⟶ «Установить приложение»;
+            iOS Safari — «Поделиться» ⟶ «На экран Домой». Открывается на весь экран.
+          </div>
+        </details>
+      </div>
+    </div>
+
     <!-- Справка -->
     <div class="card">
       <details class="help">
-        <summary>&#9432; Как открыть с телефона / подключить IP-камеру</summary>
+        <summary>&#9432; Как подключить IP-камеру телефона</summary>
         <div class="body">
-          <b>На компьютере:</b> откройте <code>http://127.0.0.1:5000</code><br>
-          <b>На телефоне (та же Wi-Fi):</b> откройте адрес компьютера
-          <span id="phoneUrls">— определяется автоматически —</span><br><br>
           <b>IP Webcam (Android):</b><br>
           1. Установите приложение «IP Webcam» из Google Play.<br>
           2. Телефон и компьютер — в одной сети Wi-Fi.<br>
@@ -2182,7 +2276,7 @@ function pollState(){
     if(s.server_urls && s.server_urls.length){
       var html = '';
       for(var i=0;i<s.server_urls.length;i++){ html += '<code>' + s.server_urls[i] + '</code> '; }
-      $('phoneUrls').innerHTML = html;
+      $('phoneUrlInline').innerHTML = html;
     }
     // телеметрия OBD-II
     var rpm = s.telemetry.rpm, temp = s.telemetry.temp, vib = s.telemetry.vibration;
@@ -2257,6 +2351,40 @@ function pollStudents(){
   }).catch(function(){});
 }
 
+// ================== PWA: УСТАНОВКА КАК ПРИЛОЖЕНИЕ + SERVICE WORKER ==================
+// ОПИСАНИЕ ЛОГИКИ: браузер (Chrome/Android) сам предлагает установку, когда есть
+// manifest.json + иконки + service worker. Мы перехватываем событие и показываем
+// свою кнопку «Установить как приложение». На iOS — «Поделиться» → «На экран Домой».
+var deferredInstall = null;
+window.addEventListener('beforeinstallprompt', function(e){
+  e.preventDefault();
+  deferredInstall = e;
+  var b = $('btnInstall');
+  if(b){ b.style.display = ''; }
+});
+function installApp(){
+  if(!deferredInstall){
+    toast('Меню браузера → «Установить приложение» / «На экран Домой»');
+    return;
+  }
+  deferredInstall.prompt();
+  deferredInstall.userChoice.then(function(){
+    deferredInstall = null;
+    var b = $('btnInstall');
+    if(b){ b.style.display = 'none'; }
+  });
+}
+window.addEventListener('appinstalled', function(){
+  toast('AI HUD установлен на устройство');
+});
+// Service Worker работает только в защищённом контексте (HTTPS/localhost) —
+// при открытии по http://IP он молча не зарегистрируется, это нормально.
+if('serviceWorker' in navigator){
+  window.addEventListener('load', function(){
+    navigator.serviceWorker.register('/sw.js').catch(function(){});
+  });
+}
+
 applyModeUI('vehicle');
 pollState(); pollEvents(); pollStudents();
 setInterval(pollState, 1000);
@@ -2307,6 +2435,156 @@ def _local_server_urls(port: int) -> list:
 def index():
     """Главная страница: HUD + боковая панель (HTML/CSS/JS зашиты в шаблон выше)."""
     return render_template_string(HTML_TEMPLATE)
+
+
+# ======================================================================================
+#  ОПИСАНИЕ ЛОГИКИ: PWA — УСТАНОВКА НА ТЕЛЕФОН КАК ПРИЛОЖЕНИЕ
+#  /manifest.json — манифест приложения; /sw.js — service worker (кэш оболочки,
+#  поток /video_feed и /api/* никогда не кэшируются); /icon/<N>.png — иконки.
+#  После открытия страницы в Chrome на Android появится «Установить приложение»,
+#  на iOS — «На экран Домой». Приложение открывается на весь экран, без адресной строки.
+# ======================================================================================
+
+SW_JS = r"""// AI HUD service worker: кэшируем только оболочку, потоки и API — всегда сеть.
+const CACHE = 'ai-hud-v1';
+const SHELL = ['/', '/manifest.json', '/icon/192.png', '/icon/512.png'];
+self.addEventListener('install', function(e){
+  e.waitUntil(caches.open(CACHE).then(function(c){ return c.addAll(SHELL); })
+    .then(function(){ return self.skipWaiting(); }));
+});
+self.addEventListener('activate', function(e){
+  e.waitUntil(self.clients.claim());
+});
+self.addEventListener('fetch', function(e){
+  if (e.request.method !== 'GET') return;
+  const url = new URL(e.request.url);
+  if (url.pathname.indexOf('/api') === 0 || url.pathname.indexOf('/video_feed') === 0
+      || url.pathname.indexOf('/qr') === 0 || url.pathname.indexOf('/sw.js') === 0) return;
+  e.respondWith(
+    fetch(e.request).then(function(r){
+      const cp = r.clone();
+      caches.open(CACHE).then(function(c){ c.put(e.request, cp); });
+      return r;
+    }).catch(function(){ return caches.match(e.request); })
+  );
+});
+"""
+
+
+@app.route("/manifest.json")
+def manifest_json():
+    return jsonify({
+        "name": "AI HUD — Real-Time Vision Overlay",
+        "short_name": "AI HUD",
+        "description": "Real-time AI HUD: детекция объектов, телеметрия, аналитика студентов",
+        "start_url": "/",
+        "scope": "/",
+        "display": "standalone",
+        "orientation": "any",
+        "background_color": "#0b0f14",
+        "theme_color": "#0b0f14",
+        "lang": "ru",
+        "icons": [
+            {"src": "/icon/192.png", "sizes": "192x192", "type": "image/png",
+             "purpose": "any maskable"},
+            {"src": "/icon/512.png", "sizes": "512x512", "type": "image/png",
+             "purpose": "any maskable"},
+        ],
+    })
+
+
+@app.route("/sw.js")
+def service_worker():
+    return Response(SW_JS, mimetype="text/javascript",
+                    headers={"Cache-Control": "no-cache"})
+
+
+@app.route("/icon/<int:size>.png")
+def app_icon(size: int):
+    size = min(1024, max(64, size))
+    data = generate_icon_png(size)
+    return Response(data, mimetype="image/png",
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
+@app.route("/qr.svg")
+def qr_svg():
+    """QR-код с адресом сервера — наведите камеру телефона и откройте страницу.
+    Генерируется библиотекой qrcode (если установлена), иначе маршрут вернёт 404
+    и фронтенд скроет картинку."""
+    try:
+        import qrcode
+        import qrcode.image.svg
+        url = request.host_url.rstrip("/")
+        img = qrcode.make(url, image_factory=qrcode.image.svg.SvgPathImage,
+                          box_size=10, border=2)
+        buf = io.BytesIO()
+        img.save(buf)
+        return Response(buf.getvalue(), mimetype="image/svg+xml",
+                        headers={"Cache-Control": "no-cache"})
+    except Exception:
+        return "qrcode не установлен", 404
+
+
+# ======================================================================================
+#  ОПИСАНИЕ ЛОГИКИ: SELF-SIGNED HTTPS (--https)
+#  Доступ к КАМЕРЕ из браузера (getUserMedia) работает только в защищённом контексте:
+#  HTTPS или localhost. Чтобы открыть страницу с ТЕЛЕФОНА по Wi-Fi и включить камеру
+#  устройства, сервер поднимается по HTTPS с самоподписанным сертификатом (браузер
+#  попросит подтвердить исключение — это нормально для локальной сети).
+#  Сертификат создаётся пакетом cryptography, а если его нет — утилитой openssl.
+# ======================================================================================
+
+def ensure_self_signed_cert(cert_path: str, key_path: str) -> bool:
+    if os.path.exists(cert_path) and os.path.exists(key_path):
+        return True
+    os.makedirs(os.path.dirname(cert_path) or ".", exist_ok=True)
+    # --- способ 1: пакет cryptography (ставится через pip) ---
+    try:
+        import datetime
+        import ipaddress
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "AI-HUD")])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        san = [x509.DNSName("localhost"), x509.IPAddress(ipaddress.IPv4Address("127.0.0.1"))]
+        try:
+            for ip in {i[4][0] for i in socket.getaddrinfo(socket.gethostname(), None,
+                                                           socket.AF_INET)}:
+                san.append(x509.IPAddress(ipaddress.IPv4Address(ip)))
+        except Exception:
+            pass
+        cert = (x509.CertificateBuilder()
+                .subject_name(name).issuer_name(name)
+                .public_key(key.public_key())
+                .serial_number(x509.random_serial_number())
+                .not_valid_before(now - datetime.timedelta(days=1))
+                .not_valid_after(now + datetime.timedelta(days=825))
+                .add_extension(x509.SubjectAlternativeName(san), critical=False)
+                .sign(key, hashes.SHA256()))
+        with open(key_path, "wb") as f:
+            f.write(key.private_bytes(serialization.Encoding.PEM,
+                                      serialization.PrivateFormat.TraditionalOpenSSL,
+                                      serialization.NoEncryption()))
+        with open(cert_path, "wb") as f:
+            f.write(cert.public_bytes(serialization.Encoding.PEM))
+        return True
+    except Exception:
+        pass
+    # --- способ 2: системная утилита openssl ---
+    try:
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+             "-keyout", key_path, "-out", cert_path, "-days", "825",
+             "-subj", "/CN=AI-HUD"],
+            check=True, capture_output=True, timeout=60)
+        return os.path.exists(cert_path) and os.path.exists(key_path)
+    except Exception:
+        return False
 
 
 @app.route("/video_feed")
@@ -2462,6 +2740,9 @@ def build_arg_parser():
     p.add_argument("--conf", type=float, default=0.35, help="порог уверенности детекции (0..1)")
     p.add_argument("--width", type=int, default=960, help="рабочая ширина кадра HUD")
     p.add_argument("--max-fps", type=int, default=24, help="ограничение FPS конвейера")
+    p.add_argument("--https", action="store_true",
+                   help="поднять HTTPS с самоподписанным сертификатом — нужен, чтобы "
+                        "камера телефона работала при открытии страницы по Wi-Fi (http://IP)")
     return p
 
 
@@ -2516,9 +2797,31 @@ def main():
     event_bus.add("Источник при старте: %s" % args.input, level="info", code="SOURCE")
 
     print_banner(args)
+    # ОПИСАНИЕ ЛОГИКИ: режим --https — самоподписанный сертификат, чтобы браузер
+    # телефона (открытый по Wi-Fi на http://IP) считался защищённым контекстом
+    # и разрешал доступ к камере (getUserMedia).
+    ssl_context = None
+    if args.https:
+        cert = os.path.join("assets", "selfsigned.crt")
+        key = os.path.join("assets", "selfsigned.key")
+        if ensure_self_signed_cert(cert, key):
+            ssl_context = (cert, key)
+            print("  HTTPS ВКЛЮЧЁН. Открывайте на телефоне:  https://<IP-КОМПЬЮТЕРА>:%d" % args.port)
+            print("  Браузер предупредит о сертификате — нажмите «Дополнительно» →")
+            print("  «Перейти на сайт» (это нормально для локальной сети).")
+            print()
+            event_bus.add("Сервер работает по HTTPS — камера телефона доступна по Wi-Fi",
+                          level="ok", code="SYSTEM")
+        else:
+            print("  ! Не удалось создать сертификат (нужен пакет 'cryptography' или утилита")
+            print("  ! openssl). Сервер продолжит работу по HTTP.")
+            event_bus.add("HTTPS не включён: нет cryptography/openssl. Камера телефона "
+                          "по Wi-Fi работать не будет (нужен HTTPS или localhost).",
+                          level="warn", code="SYSTEM")
     try:
         # threaded=True: MJPEG-поток + AJAX-опрос работают параллельно
-        app.run(host=args.host, port=args.port, threaded=True, debug=False, use_reloader=False)
+        app.run(host=args.host, port=args.port, threaded=True, debug=False,
+                use_reloader=False, ssl_context=ssl_context)
     except KeyboardInterrupt:
         pass
     finally:

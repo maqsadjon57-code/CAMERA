@@ -10,3 +10,5 @@ opencv-python>=4.8,<5     # ветка 4.x: содержит HOG-детекто�
 ultralytics>=8.1.0        # YOLOv8 (torch и torchvision установятся автоматически)
 mediapipe>=0.10.9
 numpy>=1.24
+qrcode>=7.4               # QR-код адреса для телефона (необязательно, чистый Python)
+cryptography>=42.0        # для --https (самоподписанный сертификат; не обязательно)
