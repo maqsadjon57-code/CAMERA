@@ -2600,17 +2600,26 @@ _REPO_URL = None
 
 
 def _detect_repo_url():
+    """URL ветки с кодом на GitHub. ВАЖНО: открывать нужно именно ЭТУ ветку
+    (arena/...), а не ветку по умолчанию репозитория — иначе телефон увидит
+    пустой репозиторий. Определяем remote и текущую ветку через git."""
     try:
+        base = os.path.dirname(os.path.abspath(__file__))
         out = subprocess.run(["git", "config", "--get", "remote.origin.url"],
-                             capture_output=True, timeout=5,
-                             cwd=os.path.dirname(os.path.abspath(__file__)))
+                             capture_output=True, timeout=5, cwd=base)
         url = out.stdout.decode("utf-8", "ignore").strip()
         if url.startswith("git@github.com:"):
             url = "https://github.com/" + url.split(":", 1)[1]
         if url.endswith(".git"):
             url = url[:-4]
-        if url.startswith("https://github.com/"):
-            return url
+        if not url.startswith("https://github.com/"):
+            return None
+        out2 = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                              capture_output=True, timeout=5, cwd=base)
+        branch = out2.stdout.decode("utf-8", "ignore").strip()
+        if branch and branch != "HEAD":
+            return url.rstrip("/") + "/tree/" + branch
+        return url.rstrip("/")
     except Exception:
         pass
     return None

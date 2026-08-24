@@ -1,5 +1,26 @@
 # 🖥️ AI HUD — Real-Time Computer Vision Web Application
 
+> ## 📱 НЕ ЧИТАЯ ДАЛЬШЕ — ЗАПУСК НА ТЕЛЕФОНЕ (Android)
+>
+> **Шаг 1.** Установите **Termux** из [F-Droid](https://f-droid.org/packages/com.termux/)
+> (кнопка Download APK → открыть файл → разрешить установку). Из Google Play Termux НЕ работает.
+>
+> **Шаг 2.** Откройте Termux, вставьте ОДНУ команду (долгое нажатие → Paste) и нажмите Enter:
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/maqsadjon57-code/arbitrage-win-rate-90-/arena/01a031d0-arbitrage-win-rate-90/install_phone.sh | bash
+> ```
+> Скрипт сам скачает проект, поставит зависимости, запустит сервер и откроет браузер
+> на `http://127.0.0.1:5000` — нажмите **«Разрешить доступ к камере»**, готово.
+>
+> **Нет F-Droid / не хочет Termux? Альтернатива — Pydroid 3 (Google Play):**
+> 1. Установите **Pydroid 3** и **Pydroid repository plugin** (оба из Google Play, бесплатные).
+> 2. В Pydroid: меню ☰ → Pip → установите по очереди: `flask`, `numpy`, `qrcode`, `opencv-python`.
+> 3. Скачайте `app.py` из этого репозитория (откройте файл → Raw → сохранить).
+> 4. Откройте `app.py` в Pydroid → кнопка ▶ (Run).
+> 5. В браузере телефона откройте `http://127.0.0.1:5000` → «Разрешить доступ к камере».
+>
+> ⚠️ Скачивайте файлы из ЭТОЙ ветки (`arena/…`), не из ветки `indicator` — там старый пустой репозиторий.
+
 Полнофункциональный веб-сервис **Real-Time AI HUD**: рендеринг HUD-оверлеев выполняется
 на стороне Python (OpenCV), а в браузер отдаётся **MJPEG-поток** готовых кадров.
 Веб-интерфейс (HTML/CSS/JS, встроен в `app.py`) работает на компьютере и на смартфоне.
