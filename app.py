@@ -1872,6 +1872,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .cam-badge{position:absolute; left:12px; top:10px; font-family:var(--mono); font-size:11px;
     color:#dff; background:rgba(10,14,18,.75); border:1px solid rgba(74,222,128,.55);
     padding:4px 10px; border-radius:6px; display:none; z-index:4}
+  /* ---------- QR-коды для телефона ---------- */
+  .qr-grid{display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin:10px 0}
+  .qr-item{text-align:center; max-width:150px}
+  .qr-cap{font-size:11px; letter-spacing:.6px; text-transform:uppercase;
+    color:var(--cyan); margin-bottom:5px}
   @media (max-width:960px){
     main{grid-template-columns:1fr; padding:10px}
     header{padding:8px 10px; gap:8px}
@@ -1995,13 +2000,27 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div class="body">
         <button class="btn active" id="btnInstall" style="display:none;width:100%"
                 onclick="installApp()">&#128193; Установить как приложение</button>
-        <div id="qrBox" style="text-align:center;margin:10px 0 4px">
-          <img id="qrImg" src="/qr.svg" alt="QR-код: адрес сервера"
-               style="width:148px;height:148px;background:#fff;padding:6px;border-radius:8px"
-               onerror="this.parentNode.style.display='none'">
-          <div class="hint" style="margin-top:6px">Отсканируйте камерой телефона — откроется приложение</div>
+        <div class="qr-grid">
+          <div class="qr-item">
+            <div class="qr-cap">&#127906; Адрес сервера</div>
+            <img src="/qr.svg" alt="QR: адрес сервера"
+                 style="width:132px;height:132px;background:#fff;padding:5px;border-radius:8px"
+                 onerror="this.parentNode.style.display='none'">
+            <div class="hint" id="qrSrvNote">Откройте на телефоне в той же Wi-Fi
+              (когда сервер запущен на вашем ПК)</div>
+          </div>
+          <div class="qr-item">
+            <div class="qr-cap">&#128193; Код проекта</div>
+            <img src="/qr-repo.svg" alt="QR: репозиторий проекта"
+                 style="width:132px;height:132px;background:#fff;padding:5px;border-radius:8px"
+                 onerror="this.parentNode.style.display='none'">
+            <div class="hint">Сканируйте сейчас: код + инструкция запуска
+              на телефоне (Termux)</div>
+          </div>
         </div>
-        <details class="help" open>
+        <button class="btn" style="width:100%" onclick="window.open('/qr.png','_blank')">
+          &#128247; Оба QR-кода одним изображением</button>
+        <details class="help">
           <summary>&#9432; Как открыть / запустить на телефоне</summary>
           <div class="body">
             <b>Вариант 1 — телефон как клиент (сервер на ПК):</b><br>
@@ -2278,22 +2297,17 @@ function pollState(){
       camAskShown = true;
       showCamAsk();
     }
-    // ПЕСОЧНИЦА (облачное превью): адрес защищён токеном доступа — с телефона
-    // его не открыть; QR прячем и показываем инструкцию для локального запуска
+    // ПЕСОЧНИЦА (облачное превью): адрес превью защищён токеном доступа — с телефона
+    // его не открыть; QR сервера остаётся видимым, но получает предупреждение,
+    // а рабочей «кнопкой подключения» становится QR с кодом проекта (GitHub)
     window._sandboxed = !!s.sandboxed;
     if(window._sandboxed && !window._sandboxNoteDone){
       window._sandboxNoteDone = true;
-      var qb = $('qrBox');
-      if(qb){
-        qb.innerHTML = '<div class="hint" style="text-align:left">'
-          + '&#128274; Это превью в облачной песочнице: адрес защищён токеном доступа '
-          + 'и открывается только из этого окна браузера (поэтому QR здесь не работает).<br><br>'
-          + '<b>Как запустить на своём устройстве:</b><br>'
-          + '&bull; ПК: <code>python app.py</code> (для камеры телефона по Wi-Fi — '
-          + '<code>python app.py --https</code>)<br>'
-          + '&bull; Телефон (Termux): <code>bash run_phone.sh</code> → в браузере '
-          + '<code>http://127.0.0.1:5000</code> — камера работает сразу.'
-          + '</div>';
+      var qn = $('qrSrvNote');
+      if(qn){
+        qn.innerHTML = '&#9888;&#65039; Это облачное превью: его адрес защищён токеном '
+          + 'и с телефона <b>не откроется</b>. QR начнёт работать, когда запустите '
+          + '<code>python app.py</code> на своём ПК.';
       }
       var pi = $('phoneUrlInline');
       if(pi){ pi.innerHTML = '— недоступно из песочницы (запустите на своём ПК/телефоне) —'; }
@@ -2579,6 +2593,113 @@ def qr_svg():
         return "qrcode не установлен", 404
 
 
+# ОПИСАНИЕ ЛОГИКИ: URL репозитория определяется по git remote при старте —
+# по этому QR телефон СРАЗУ открывает код проекта и инструкцию запуска на Termux
+# (работает из любого места, в отличие от адреса сервера в облачной песочнице).
+_REPO_URL = None
+
+
+def _detect_repo_url():
+    try:
+        out = subprocess.run(["git", "config", "--get", "remote.origin.url"],
+                             capture_output=True, timeout=5,
+                             cwd=os.path.dirname(os.path.abspath(__file__)))
+        url = out.stdout.decode("utf-8", "ignore").strip()
+        if url.startswith("git@github.com:"):
+            url = "https://github.com/" + url.split(":", 1)[1]
+        if url.endswith(".git"):
+            url = url[:-4]
+        if url.startswith("https://github.com/"):
+            return url
+    except Exception:
+        pass
+    return None
+
+
+@app.route("/qr-repo.svg")
+def qr_repo_svg():
+    """QR-код со ссылкой на репозиторий проекта (сканируется всегда и отовсюду)."""
+    if not _REPO_URL:
+        return "репозиторий не определён", 404
+    try:
+        import qrcode
+        import qrcode.image.svg
+        img = qrcode.make(_REPO_URL, image_factory=qrcode.image.svg.SvgPathImage,
+                          box_size=10, border=2)
+        buf = io.BytesIO()
+        img.save(buf)
+        return Response(buf.getvalue(), mimetype="image/svg+xml",
+                        headers={"Cache-Control": "no-cache"})
+    except Exception:
+        return "qrcode не установлен", 404
+
+
+def _qr_matrix_to_bgr(text: str, px: int = 10):
+    """Матрица QR → чёрно-белое BGR-изображение (без Pillow, только NumPy/OpenCV)."""
+    import qrcode
+    qr = qrcode.QRCode(border=4, box_size=1,
+                       error_correction=qrcode.constants.ERROR_CORRECT_M)
+    qr.add_data(text)
+    qr.make(fit=True)
+    m = qr.get_matrix()
+    h, w = len(m), len(m[0])
+    img = np.zeros((h, w), dtype=np.uint8)
+    for y, row in enumerate(m):
+        for x, v in enumerate(row):
+            img[y, x] = 0 if v else 255
+    img = cv2.resize(img, (w * px, h * px), interpolation=cv2.INTER_NEAREST)
+    return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+
+@app.route("/qr.png")
+def qr_png():
+    """ОДНО изображение с двумя QR-кодами для подключения телефона:
+    (1) адрес сервера — работает при запуске на своём ПК/в локальной сети;
+    (2) код проекта (GitHub) — сканируется всегда: инструкция запуска на Termux.
+    Изображение удобно показать на экране и отсканировать телефоном."""
+    try:
+        server_url = request.host_url.rstrip("/")
+        blocks = [("1) SERVER ADDRESS (your own PC / LAN)", server_url,
+                   "Works when app.py runs on your PC: open on phone in same Wi-Fi"
+                   " (use --https for camera)")]
+        if _REPO_URL:
+            blocks.append(("2) PROJECT CODE - GitHub (scan now)", _REPO_URL,
+                           "Code + phone instructions: Termux -> bash run_phone.sh"))
+        px = 10
+        pad, cap_h, note_h = 26, 34, 46
+        imgs = [_qr_matrix_to_bgr(b[1], px=px) for b in blocks]
+        qr_w = max(im.shape[1] for im in imgs)
+        W = qr_w + pad * 2
+        H = pad
+        for im in imgs:
+            H += cap_h + im.shape[0] + note_h + 24
+        H += pad
+        canvas = np.full((H, W, 3), 255, dtype=np.uint8)
+        y = pad
+        for idx, (b, im) in enumerate(zip(blocks, imgs)):
+            cv2.putText(canvas, b[0], (pad, y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.62,
+                        (10, 10, 10), 2, cv2.LINE_AA)
+            y += cap_h
+            x = (W - im.shape[1]) // 2
+            canvas[y:y + im.shape[0], x:x + im.shape[1]] = im
+            y += im.shape[0] + 8
+            # URL крупно — читается и глазами, и камерой
+            cv2.putText(canvas, b[1], (pad, y + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.52,
+                        (20, 20, 120), 1, cv2.LINE_AA)
+            cv2.putText(canvas, b[2], (pad, y + 36), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                        (90, 90, 90), 1, cv2.LINE_AA)
+            y += note_h + 24
+            if idx < len(blocks) - 1:
+                cv2.line(canvas, (pad, y - 12), (W - pad, y - 12), (210, 210, 210), 1)
+        ok, buf = cv2.imencode(".png", canvas)
+        if not ok:
+            return "encode error", 500
+        return Response(buf.tobytes(), mimetype="image/png",
+                        headers={"Cache-Control": "no-cache"})
+    except Exception:
+        return "qrcode не установлен", 404
+
+
 # ======================================================================================
 #  ОПИСАНИЕ ЛОГИКИ: SELF-SIGNED HTTPS (--https)
 #  Доступ к КАМЕРЕ из браузера (getUserMedia) работает только в защищённом контексте:
@@ -2821,9 +2942,10 @@ def print_banner(args):
 
 
 def main():
-    global _capture, _detector, _pose_analyzer, _tracker, _diagnostic, _renderer, _telemetry, _pipeline, _push_buffer
+    global _capture, _detector, _pose_analyzer, _tracker, _diagnostic, _renderer, _telemetry, _pipeline, _push_buffer, _REPO_URL
     args = build_arg_parser().parse_args()
     _SERVER_URLS.extend(_local_server_urls(args.port))
+    _REPO_URL = _detect_repo_url()      # для QR «код проекта» (работает отовсюду)
 
     # ---- создаём все компоненты системы ----
     _telemetry = VehicleTelemetry()                                   # OBD-II симулятор
